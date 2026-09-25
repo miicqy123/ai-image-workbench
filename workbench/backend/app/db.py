@@ -9,6 +9,7 @@ import threading
 import uuid
 import time
 import os
+from contextlib import contextmanager
 
 DB_PATH = os.environ.get("WB_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "data", "db", "workbench.db"))
 _lock = threading.Lock()
@@ -97,6 +98,21 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+@contextmanager
+def tx():
+    """单连接事务：在全局锁内复用同一连接，提交或回滚。"""
+    with _lock:
+        conn = _connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def init_db() -> None:

@@ -18,6 +18,12 @@ FONT_CANDIDATES = [
     "C:/Windows/Fonts/msyh.ttc",
     "C:/Windows/Fonts/msyhbd.ttc",
     "C:/Windows/Fonts/simhei.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
 ]
 
 
@@ -74,15 +80,14 @@ def _hex(c):
 
 
 def _gradient(w, h, top, bottom):
-    img = Image.new("RGBA", (w, h))
-    dr = ImageDraw.Draw(img)
     t = _hex(top); b = _hex(bottom)
+    col = Image.new("RGB", (1, h))
     for y in range(h):
         r = int(t[0] + (b[0] - t[0]) * y / h)
         g = int(t[1] + (b[1] - t[1]) * y / h)
         bl = int(t[2] + (b[2] - t[2]) * y / h)
-        dr.line([(0, y), (w, y)], fill=(r, g, bl, 255))
-    return img
+        col.putpixel((0, y), (r, g, bl))
+    return col.resize((w, h)).convert("RGBA")
 
 
 def _fit_product(prod: Image.Image, max_w, max_h) -> Image.Image:

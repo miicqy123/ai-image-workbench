@@ -138,11 +138,11 @@ def validate_image_params(model_id: str, params: dict) -> list:
     if ar and ar not in cap.get("aspect_ratios", []):
         errs.append(f"模型不支持画幅 {ar}")
     # count
-    count = int(params.get("count", schema.get("count", {}).get("default", 1)))
+    count = _to_int(params.get("count", schema.get("count", {}).get("default", 1)), 1)
     if count < 1 or count > cap.get("max_count", 1):
         errs.append(f"张数超出模型范围 1..{cap.get('max_count',1)}")
     # reference images
-    ref_n = int(params.get("reference_count", 0))
+    ref_n = _to_int(params.get("reference_count", 0), 0)
     if ref_n > cap.get("image_input_limit", 0):
         errs.append(f"参考图数量超出模型上限 {cap.get('image_input_limit',0)}")
     return errs
@@ -161,6 +161,13 @@ def _as_json_str(v, field_name: str) -> str:
     return v
 
 
+def _to_int(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def create_model(m: dict) -> dict:
     model_id = (m.get("model_id") or "").strip()
     if not model_id:
@@ -173,7 +180,7 @@ def create_model(m: dict) -> dict:
         "INSERT INTO model_registry(model_id,provider,modality,capabilities_json,parameter_schema,enabled,cost_policy,workflow_version) "
         "VALUES(?,?,?,?,?,?,?,?)",
         (model_id, m.get("provider", "local"), m.get("modality", "image"), cap, ps,
-         int(m.get("enabled", 1)), m.get("cost_policy", "free_local"), m.get("workflow_version", "v1")),
+         _to_int(m.get("enabled", 1), 1), m.get("cost_policy", "free_local"), m.get("workflow_version", "v1")),
     )
     return get_model(model_id)
 
@@ -187,7 +194,7 @@ def update_model(model_id: str, patch: dict) -> dict | None:
         if k in patch and patch[k] is not None:
             fields[k] = patch[k]
     if "enabled" in patch and patch["enabled"] is not None:
-        fields["enabled"] = int(patch["enabled"])
+        fields["enabled"] = _to_int(patch["enabled"], 1)
     if "capabilities_json" in patch:
         fields["capabilities_json"] = _as_json_str(patch["capabilities_json"], "capabilities_json")
     if "parameter_schema" in patch:

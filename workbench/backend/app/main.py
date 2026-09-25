@@ -9,12 +9,13 @@ import os
 import threading
 import time
 import zipfile
+from collections import defaultdict, deque
 from PIL import Image, ImageDraw
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Union
 
 from . import db, storage
 from . import registry
@@ -22,10 +23,52 @@ from .generators import text as text_gen
 from .generators import image as image_gen
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
+    "WB_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000",
+).split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS, allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
 )
+
+WB_API_TOKEN = os.environ.get("WB_API_TOKEN", "").strip()
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    path = request.url.path
+    if WB_API_TOKEN and (path.startswith("/api") or path.startswith("/files")):
+        if path == "/api/health":
+            return await call_next(request)
+        if request.headers.get("Authorization", "") != f"Bearer {WB_API_TOKEN}":
+            return JSONResponse({"detail": "未授权：请提供有效的 Bearer Token"}, status_code=401)
+    return await call_next(request)
+
+
+try:
+    _RATE_LIMIT = int(os.environ.get("WB_RATE_LIMIT", "600"))
+except ValueError:
+    _RATE_LIMIT = 600
+_RATE_WINDOW = 60.0
+_rate_hits = defaultdict(deque)
+_rate_lock = threading.Lock()
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request, call_next):
+    if request.url.path.startswith("/api") and request.url.path != "/api/health":
+        ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        with _rate_lock:
+            q = _rate_hits[ip]
+            while q and now - q[0] > _RATE_WINDOW:
+                q.popleft()
+            if len(q) >= _RATE_LIMIT:
+                return JSONResponse({"detail": "请求过于频繁，请稍后再试"}, status_code=429)
+            q.append(now)
+    return await call_next(request)
 
 
 def _init():
@@ -52,28 +95,31 @@ def get_current_version(node_id):
 
 
 def set_node_version(node_id, content, locks=None, author_type="human", model_id=None, input_snapshot=None):
-    cur = db.query_one("SELECT current_version FROM nodes WHERE id=?", (node_id,))
-    nv = (cur["current_version"] if cur else 0) + 1
-    db.execute(
-        "INSERT INTO node_versions(node_id,version,input_snapshot_json,content_json,locks_json,author_type,model_id,created_at) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        (node_id, nv, json.dumps(input_snapshot or {}), json.dumps(content), json.dumps(locks or []),
-         author_type, model_id, db.now()),
-    )
-    db.execute("UPDATE nodes SET current_version=?, status='ready' WHERE id=?", (nv, node_id))
+    with db.tx() as conn:
+        cur = conn.execute("SELECT current_version FROM nodes WHERE id=?", (node_id,)).fetchone()
+        nv = (cur["current_version"] if cur else 0) + 1
+        conn.execute(
+            "INSERT INTO node_versions(node_id,version,input_snapshot_json,content_json,locks_json,author_type,model_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (node_id, nv, json.dumps(input_snapshot or {}), json.dumps(content), json.dumps(locks or []),
+             author_type, model_id, db.now()),
+        )
+        conn.execute("UPDATE nodes SET current_version=?, status='ready' WHERE id=?", (nv, node_id))
     return nv
 
 
 def downstream_node_ids(node_id):
     """BFS 下游节点 id 列表（不含自身）。"""
     seen = []
+    visited = {node_id}
     frontier = [node_id]
     while frontier:
         n = frontier.pop()
         edges = db.query("SELECT to_node FROM edges WHERE from_node=?", (n,))
         for e in edges:
             t = e["to_node"]
-            if t not in seen:
+            if t not in visited:
+                visited.add(t)
                 seen.append(t)
                 frontier.append(t)
     return seen
@@ -122,6 +168,33 @@ def get_project(pid):
 
 @app.delete("/api/projects/{pid}")
 def delete_project(pid):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    asset_ids = [a["id"] for a in db.query("SELECT id FROM assets WHERE project_id=?", (pid,))]
+    db.execute("DELETE FROM canvas_layers WHERE project_id=?", (pid,))
+    db.execute("DELETE FROM agent_plans WHERE project_id=?", (pid,))
+    db.execute("DELETE FROM audit_events WHERE project_id=?", (pid,))
+    for aid in asset_ids:
+        db.execute("DELETE FROM export_records WHERE image_asset_id=?", (aid,))
+    g = db.query_one("SELECT id FROM graphs WHERE project_id=?", (pid,))
+    if g:
+        node_ids = [n["id"] for n in db.query("SELECT id FROM nodes WHERE graph_id=?", (g["id"],))]
+        for nid in node_ids:
+            db.execute("DELETE FROM node_versions WHERE node_id=?", (nid,))
+            db.execute("DELETE FROM node_candidates WHERE node_id=?", (nid,))
+            for r in db.query("SELECT id FROM node_runs WHERE node_id=?", (nid,)):
+                db.execute("DELETE FROM run_outputs WHERE run_id=?", (r["id"],))
+                db.execute("DELETE FROM run_inputs WHERE run_id=?", (r["id"],))
+                db.execute("DELETE FROM node_runs WHERE id=?", (r["id"],))
+            db.execute("DELETE FROM nodes WHERE id=?", (nid,))
+        db.execute("DELETE FROM edges WHERE graph_id=?", (g["id"],))
+        db.execute("DELETE FROM graphs WHERE id=?", (g["id"],))
+    for a in db.query("SELECT id,object_key FROM assets WHERE project_id=?", (pid,)):
+        try:
+            storage.delete(a["object_key"])
+        except Exception:
+            pass
+        db.execute("DELETE FROM assets WHERE id=?", (a["id"],))
     db.execute("DELETE FROM projects WHERE id=?", (pid,))
     return {"ok": True}
 
@@ -168,7 +241,15 @@ def put_defaults(pid: str, body: DefaultsUpdate):
 @app.post("/api/projects/{pid}/assets")
 def upload_asset(pid: str, file: UploadFile = File(...), role: str = Form("product"),
                 source: str = Form("upload"), origin: str = Form("")):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
     data = file.file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "文件过大（上限 20MB）")
+    try:
+        Image.open(io.BytesIO(data)).verify()
+    except Exception:
+        raise HTTPException(400, "不是有效的图片文件")
     meta = storage.save_upload(pid, file.filename or "file", data)
     aid = db.gen_id("ast")
     db.execute(
@@ -192,8 +273,7 @@ def file_content(asset_id: str):
     if not a:
         raise HTTPException(404, "资产不存在")
     data = storage.read_bytes(a["object_key"])
-    return FileResponse(io.BytesIO(data), media_type=a["mime"] or "image/png",
-                        filename=f"{asset_id}.{a['mime'].split('/')[-1] if a['mime'] else 'png'}")
+    return Response(content=data, media_type=a["mime"] or "image/png")
 
 
 # ---------------- graph ----------------
@@ -383,8 +463,13 @@ def apply_candidate(nid: str, body: ApplyCandidate):
     c = db.query_one("SELECT * FROM node_candidates WHERE id=? AND node_id=?", (body.candidate_id, nid))
     if not c:
         raise HTTPException(404, "候选不存在")
+    cur = db.query_one("SELECT current_version FROM nodes WHERE id=?", (nid,))
+    if not cur:
+        raise HTTPException(404, "节点不存在")
+    if c["base_version"] != cur["current_version"]:
+        raise HTTPException(409, "节点已更新，候选基于的版本已过期，请重新生成")
     content = json_loads(c["content_json"])
-    before = db.query_one("SELECT current_version FROM nodes WHERE id=?", (nid,))["current_version"]
+    before = cur["current_version"]
     set_node_version(nid, content, author_type="ai")
     mark_stale(nid)
     after = db.query_one("SELECT current_version FROM nodes WHERE id=?", (nid,))["current_version"]
@@ -441,8 +526,9 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
         set_node_version(node_id, prompt, author_type="ai", model_id=model_id or "rule-based-planner")
         return {"outputs": [], "usage": {"model": "rule-based-planner"}, "provider_task_id": "prompt"}
     if ntype == "image_generation":
+        pid = get_project_of_node(node_id)
         prompt_content = get_current_version(node_id)
-        # 解析上游：prompt 节点 + product image 节点
+        # 解析上游：prompt 节点 + product image 节点（向上多跳追溯）
         prompt_node = upstream_of_type(node_id, "image_prompt")
         img_node = upstream_of_type(node_id, "product_image")
         pc = get_current_version(prompt_node) if prompt_node else {}
@@ -454,7 +540,9 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
             ia = get_current_version(img_node).get("asset_id")
             if ia:
                 refs.append(ia)
-        refs += ref_asset_ids
+        for rid in ref_asset_ids:
+            if db.query_one("SELECT id FROM assets WHERE id=? AND project_id=?", (rid, pid)):
+                refs.append(rid)
         # 校验模型能力
         errs = registry.validate_image_params(model_id, {"aspect_ratio": ar, "count": params.get("count", 1),
                                                           "reference_count": len(refs)})
@@ -475,15 +563,15 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
         outputs = []
         for o in res["outputs"]:
             aid = db.gen_id("ast")
-            obj_key = f"{get_project_of_node(node_id)}/{aid}.png"
+            obj_key = f"{pid}/{aid}.png"
             storage.save_bytes(obj_key, o["bytes"])
             db.execute("INSERT INTO assets(id,tenant_id,project_id,kind,role,object_key,sha256,mime,width,height,created_at,source,origin,usage_rights_status) "
                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (aid, "tnt_default", get_project_of_node(node_id), "image", "generated", obj_key, "", "image/png",
+                       (aid, "tnt_default", pid, "image", "generated", obj_key, "", "image/png",
                         o["width"], o["height"], db.now(), "generation", model_id, "generated"))
             outputs.append({"asset_id": aid, "object_key": obj_key, "width": o["width"], "height": o["height"]})
         # 记录图层（背景/产品/文字），支持可编辑排版导出
-        record_layers(get_project_of_node(node_id), node_id, run_id, outputs, params)
+        record_layers(pid, node_id, run_id, outputs, params)
         # 把生成结果写回节点 content，供画布缩略图与版本追溯
         cur = get_current_version(node_id) or {}
         all_out = (cur.get("outputs", []) or []) + [o["asset_id"] for o in outputs]
@@ -510,33 +598,47 @@ def record_layers(project_id, node_id, run_id, outputs, params):
 
 
 def upstream_of_type(node_id, type_):
-    edges = db.query("SELECT from_node FROM edges WHERE to_node=?", (node_id,))
-    for e in edges:
-        fn = db.query_one("SELECT id,type FROM nodes WHERE id=?", (e["from_node"],))
-        if fn and fn["type"] == type_:
-            return fn["id"]
+    """沿入边向上多跳追溯，返回最近的指定类型节点；仅限同一 graph。"""
+    root = db.query_one("SELECT graph_id FROM nodes WHERE id=?", (node_id,))
+    if not root:
+        return None
+    gid = root["graph_id"]
+    visited = {node_id}
+    frontier = [node_id]
+    while frontier:
+        n = frontier.pop(0)
+        edges = db.query("SELECT from_node FROM edges WHERE to_node=? AND graph_id=?", (n, gid))
+        for e in edges:
+            fn_id = e["from_node"]
+            if fn_id in visited:
+                continue
+            visited.add(fn_id)
+            fn = db.query_one("SELECT id,type FROM nodes WHERE id=? AND graph_id=?", (fn_id, gid))
+            if fn and fn["type"] == type_:
+                return fn["id"]
+            frontier.append(fn_id)
     return None
 
 
 def get_upstream_facts(node_id):
-    # 沿 facts 边回溯
-    edges = db.query("SELECT from_node,from_port FROM edges WHERE to_node=?", (node_id,))
+    n = db.query_one("SELECT graph_id FROM nodes WHERE id=?", (node_id,))
+    if not n:
+        return {}
+    gid = n["graph_id"]
+    # 沿直接 facts 边回溯
+    edges = db.query("SELECT from_node FROM edges WHERE to_node=? AND graph_id=?", (node_id, gid))
     for e in edges:
-        fn = db.query_one("SELECT id,type FROM nodes WHERE id=?", (e["from_node"],))
+        fn = db.query_one("SELECT id,type FROM nodes WHERE id=? AND graph_id=?", (e["from_node"], gid))
         if fn and fn["type"] == "product_facts":
             return get_current_version(fn["id"]) or {}
-    # 退而求其次：同图内任一 product_facts
-    f = db.query_one("SELECT n.id FROM nodes n JOIN edges ed ON ed.from_node=n.id WHERE n.type='product_facts' LIMIT 1")
+    # 退而求其次：同图内任一 product_facts（跨项目隔离）
+    f = db.query_one("SELECT id FROM nodes WHERE graph_id=? AND type='product_facts' LIMIT 1", (gid,))
     return get_current_version(f["id"]) if f else {}
 
 
 def get_upstream_strategy(node_id):
-    edges = db.query("SELECT from_node FROM edges WHERE to_node=?", (node_id,))
-    for e in edges:
-        fn = db.query_one("SELECT id,type FROM nodes WHERE id=?", (e["from_node"],))
-        if fn and fn["type"] == "strategy":
-            return get_current_version(fn["id"]) or {}
-    return {}
+    sid = upstream_of_type(node_id, "strategy")
+    return get_current_version(sid) if sid else {}
 
 
 @app.post("/api/nodes/{nid}/runs")
@@ -607,6 +709,8 @@ def run_events(rid: str):
 @app.post("/api/graphs/{gid}/run-downstream")
 def run_downstream(gid: str, body: dict):
     from_node = body.get("from_node_id")
+    if not from_node or not db.query_one("SELECT id FROM nodes WHERE id=?", (from_node,)):
+        raise HTTPException(404, "起始节点不存在")
     ds = downstream_node_ids(from_node)
     ran = []
     for d in ds:
@@ -623,10 +727,31 @@ def models():
     return registry.get_models()
 
 
+class ModelCreate(BaseModel):
+    model_id: str
+    provider: str = "local"
+    modality: str = "image"
+    capabilities_json: Union[dict, str] = {}
+    parameter_schema: Union[dict, str] = {}
+    enabled: int = 1
+    cost_policy: str = "free_local"
+    workflow_version: str = "v1"
+
+
+class ModelUpdate(BaseModel):
+    provider: Optional[str] = None
+    modality: Optional[str] = None
+    capabilities_json: Optional[Union[dict, str]] = None
+    parameter_schema: Optional[Union[dict, str]] = None
+    enabled: Optional[int] = None
+    cost_policy: Optional[str] = None
+    workflow_version: Optional[str] = None
+
+
 @app.post("/api/models", status_code=201)
-def create_model_api(m: dict):
+def create_model_api(m: ModelCreate):
     try:
-        return registry.create_model(m)
+        return registry.create_model(m.model_dump())
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -640,9 +765,9 @@ def get_model_api(model_id: str):
 
 
 @app.put("/api/models/{model_id}")
-def update_model_api(model_id: str, patch: dict):
+def update_model_api(model_id: str, patch: ModelUpdate):
     try:
-        m = registry.update_model(model_id, patch)
+        m = registry.update_model(model_id, patch.model_dump(exclude_unset=True))
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not m:
@@ -743,9 +868,11 @@ def export_layout(pid: str, body: dict):
     base_asset = body.get("base_asset_id")
     if not base_asset:
         raise HTTPException(422, "缺少 base_asset_id")
-    a = db.query_one("SELECT object_key,width,height FROM assets WHERE id=?", (base_asset,))
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    a = db.query_one("SELECT object_key,width,height FROM assets WHERE id=? AND project_id=?", (base_asset, pid))
     if not a:
-        raise HTTPException(404, "底图不存在")
+        raise HTTPException(404, "底图不存在或不属于当前项目")
     base_im = storage.read_pillow(a["object_key"]).convert("RGB")
     title = body.get("title", "")
     subtitle = body.get("subtitle", "")
@@ -815,7 +942,8 @@ def export_package(pid: str):
                 pass
         z.writestr("README.txt", "企业营销生图工作台导出包：project.json 为节点图与提示词；assets/ 为素材。导入时按 asset id 还原引用。")
     buf.seek(0)
-    return FileResponse(buf, media_type="application/zip", filename=f"{pid}_export.zip")
+    headers = {"Content-Disposition": f'attachment; filename="{pid}_export.zip"'}
+    return Response(content=buf.getvalue(), media_type="application/zip", headers=headers)
 
 
 # ---------------- agent plan (P1 草案，不自动执行) ----------------
