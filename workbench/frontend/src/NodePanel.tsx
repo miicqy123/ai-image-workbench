@@ -60,17 +60,26 @@ export default function NodePanel({ node, pid, assets, models, defaultTextModel,
   }
 
   if (node.type === 'product_image') {
+    const refs: string[] = c.reference_asset_ids || (c.asset_id ? [c.asset_id] : [])
+    const toggle = (id: string) => {
+      const next = refs.includes(id) ? refs.filter((x) => x !== id) : [...refs, id]
+      onPatch({ ...c, asset_id: next[0] || null, reference_asset_ids: next, asset_role: 'product' })
+    }
     return (
       <div>
-        <div className="section-title">产品素材节点</div>
-        <div className="field"><label>挂载产品参考图</label>
-          <select value={c.asset_id || ''} onChange={(e) => onPatch({ ...c, asset_id: e.target.value, asset_role: 'product' })}>
-            <option value="">— 选择素材 —</option>
-            {assets.filter((a) => a.role === 'product' || a.role === 'generated').map((a) => <option key={a.id} value={a.id}>{a.id} ({a.width}×{a.height})</option>)}
-          </select>
+        <div className="section-title">产品素材节点（可多选）</div>
+        <div className="field"><label>挂载产品参考图 / Logo（可多张）</label>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {assets.filter((a) => a.role === 'product' || a.role === 'generated').map((a) => (
+              <label key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                <input type="checkbox" checked={refs.includes(a.id)} onChange={() => toggle(a.id)} />
+                <img src={fileUrl(a.id)} style={{ width: 36, height: 36, objectFit: 'cover', borderRadius: 4 }} alt="" />
+                {a.id.slice(-6)}
+              </label>
+            ))}
+          </div>
         </div>
-        {c.asset_id && <img src={fileUrl(c.asset_id)} style={{ width: '100%', borderRadius: 8, border: '1px solid #eee' }} alt="" />}
-        <div className="hint">参考图将作为生图的「产品主体」来源（视觉参考端口）。</div>
+        {refs.length > 0 && <div className="hint">已选 {refs.length} 张参考图，将作为生图的「产品主体 / 视觉参考」来源。</div>}
       </div>
     )
   }

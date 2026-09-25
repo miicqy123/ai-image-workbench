@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS graphs (
     id TEXT PRIMARY KEY, project_id TEXT, current_version INT DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS nodes (
-    id TEXT PRIMARY KEY, graph_id TEXT, type TEXT, position_json TEXT,
+    id TEXT PRIMARY KEY, graph_id TEXT, type TEXT, name TEXT, position_json TEXT,
     current_version INT DEFAULT 1, status TEXT DEFAULT 'draft'
 );
 CREATE TABLE IF NOT EXISTS edges (
@@ -77,10 +77,14 @@ CREATE TABLE IF NOT EXISTS export_records (
     id TEXT PRIMARY KEY, canvas_version INT, image_asset_id TEXT,
     format TEXT, width INT, height INT, approval_state TEXT
 );
+CREATE TABLE IF NOT EXISTS providers (
+    id TEXT PRIMARY KEY, name TEXT, base_url TEXT, api_key TEXT,
+    enabled INT DEFAULT 1, created_at REAL
+);
 CREATE TABLE IF NOT EXISTS model_registry (
     model_id TEXT PRIMARY KEY, provider TEXT, modality TEXT,
     capabilities_json TEXT, parameter_schema TEXT, enabled INT DEFAULT 1,
-    cost_policy TEXT, workflow_version TEXT
+    cost_policy TEXT, workflow_version TEXT, provider_id TEXT, adapter TEXT
 );
 CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY, project_id TEXT, actor_id TEXT, action TEXT,
@@ -125,6 +129,13 @@ def init_db() -> None:
         for col, ctype in [("default_text_model", "TEXT"), ("default_image_model", "TEXT")]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {ctype}")
+        mcols = [r["name"] for r in conn.execute("PRAGMA table_info(model_registry)")]
+        for col in ("provider_id", "adapter"):
+            if col not in mcols:
+                conn.execute(f"ALTER TABLE model_registry ADD COLUMN {col} TEXT")
+        ncols = [r["name"] for r in conn.execute("PRAGMA table_info(nodes)")]
+        if "name" not in ncols:
+            conn.execute("ALTER TABLE nodes ADD COLUMN name TEXT")
         conn.commit()
         # 默认租户，便于单机演示（生产应做真实鉴权与隔离）
         conn.execute("INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)", ("tnt_default", "默认企业租户"))

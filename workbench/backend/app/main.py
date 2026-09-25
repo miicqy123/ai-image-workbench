@@ -199,6 +199,21 @@ def delete_project(pid):
     return {"ok": True}
 
 
+class ProjectRename(BaseModel):
+    name: str
+
+
+@app.patch("/api/projects/{pid}")
+def rename_project(pid: str, body: ProjectRename):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(422, "项目名不能为空")
+    db.execute("UPDATE projects SET name=?, updated_at=? WHERE id=?", (name, db.now(), pid))
+    return {"ok": True, "name": name}
+
+
 @app.get("/api/projects/{pid}/defaults")
 def get_defaults(pid: str):
     p = db.query_one("SELECT default_text_model, default_image_model FROM projects WHERE id=?", (pid,))
@@ -262,6 +277,64 @@ def upload_asset(pid: str, file: UploadFile = File(...), role: str = Form("produ
             "mime": meta["mime"], "object_key": meta["object_key"]}
 
 
+def _extract_text(filename: str, data: bytes) -> str:
+    import re
+    name = (filename or "").lower()
+    if name.endswith((".txt", ".md", ".markdown", ".csv")):
+        return data.decode("utf-8", errors="replace")
+    if name.endswith(".json"):
+        try:
+            return json.dumps(json.loads(data.decode("utf-8", errors="replace")), ensure_ascii=False, indent=2)
+        except Exception:
+            return data.decode("utf-8", errors="replace")
+    if name.endswith(".docx"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+            xml = re.sub(r"<w:p[ >]", "\n", xml)
+            xml = re.sub(r"<[^>]+>", "", xml)
+            return xml
+        except Exception:
+            raise HTTPException(400, "无法解析该 docx 文件")
+    raise HTTPException(400, "仅支持 txt / md / json / csv / docx")
+
+
+@app.post("/api/projects/{pid}/assets/batch")
+def upload_assets_batch(pid: str, files: list[UploadFile] = File(...), role: str = Form("product"), source: str = Form("upload")):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    results = []
+    for f in files:
+        data = f.file.read()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"{f.filename} 超过 20MB 上限")
+        try:
+            Image.open(io.BytesIO(data)).verify()
+        except Exception:
+            raise HTTPException(400, f"{f.filename} 不是有效的图片文件")
+        meta = storage.save_upload(pid, f.filename or "file", data)
+        aid = db.gen_id("ast")
+        db.execute(
+            "INSERT INTO assets(id,tenant_id,project_id,kind,role,object_key,sha256,mime,width,height,created_at,source,origin,usage_rights_status) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (aid, "tnt_default", pid, "image", role, meta["object_key"], meta["sha256"], meta["mime"],
+             meta["width"], meta["height"], db.now(), source, "", "pending_check"),
+        )
+        results.append({"id": aid, "role": role, "width": meta["width"], "height": meta["height"], "mime": meta["mime"]})
+    return {"assets": results}
+
+
+@app.post("/api/projects/{pid}/files/import")
+def import_text_file(pid: str, file: UploadFile = File(...)):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    data = file.file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "文件过大")
+    text = _extract_text(file.filename or "", data)
+    return {"filename": file.filename, "text": text}
+
+
 @app.get("/api/projects/{pid}/assets")
 def list_assets(pid: str):
     return db.query("SELECT id,role,kind,mime,width,height,created_at,object_key FROM assets WHERE project_id=?", (pid,))
@@ -282,7 +355,7 @@ def get_graph(pid: str):
     g = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     if not g:
         raise HTTPException(404, "图不存在")
-    nodes = db.query("SELECT id,graph_id,type,position_json,current_version,status FROM nodes WHERE graph_id=?", (g["id"],))
+    nodes = db.query("SELECT id,graph_id,type,name,position_json,current_version,status FROM nodes WHERE graph_id=?", (g["id"],))
     edges = db.query("SELECT id,from_node,from_port,to_node,to_port,semantic FROM edges WHERE graph_id=?", (g["id"],))
     out_nodes = []
     for n in nodes:
@@ -356,19 +429,32 @@ def validate_edge(from_node, from_port, to_node, to_port):
     return None
 
 
+class InitWorkflow(BaseModel):
+    skeleton: str = "poster"
+
+
+WORKFLOW_SKELETONS = {
+    "poster":       {"facts": True, "image": True, "prompts": 1, "review": True},
+    "long":         {"facts": True, "image": True, "prompts": 1, "review": True},
+    "detail":       {"facts": True, "image": True, "prompts": 3, "review": True},
+    "cover":        {"facts": False, "image": True, "prompts": 1, "review": True},
+    "illustration": {"facts": False, "image": False, "prompts": 1, "review": True},
+}
+
+
 @app.post("/api/projects/{pid}/graph/init-template")
-def init_template(pid: str):
+def init_template(pid: str, body: InitWorkflow | None = None):
     g = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     if not g:
         raise HTTPException(404, "图不存在")
-    # 清空旧节点
+    sk = WORKFLOW_SKELETONS.get((body.skeleton if body else "poster"), WORKFLOW_SKELETONS["poster"])
     db.execute("DELETE FROM nodes WHERE graph_id=?", (g["id"],))
     db.execute("DELETE FROM edges WHERE graph_id=?", (g["id"],))
 
     def add(type_, x, y, content=None):
         nid = db.gen_id(type_[:4])
-        db.execute("INSERT INTO nodes(id,graph_id,type,position_json,current_version,status) VALUES(?,?,?,?,1,?)",
-                   (nid, g["id"], type_, json.dumps({"x": x, "y": y}), "draft"))
+        db.execute("INSERT INTO nodes(id,graph_id,type,name,position_json,current_version,status) VALUES(?,?,?,?,?,1,?)",
+                   (nid, g["id"], type_, NODE_NAMES.get(type_, type_), json.dumps({"x": x, "y": y}), "draft"))
         if content is not None:
             set_node_version(nid, content, author_type="system")
         return nid
@@ -378,30 +464,76 @@ def init_template(pid: str):
         db.execute("INSERT INTO edges(id,graph_id,from_node,from_port,to_node,to_port,semantic) VALUES(?,?,?,?,?,?,?)",
                    (eid, g["id"], f, fp, t, tp, sem))
 
-    n_facts = add("product_facts", 40, 220, {
-        "product_id": "", "product_name": "", "activity_version": "",
-        "confirmed_selling_points": [], "locked_appearance": [], "applicable_scenes": [],
-        "forbidden_expressions": [], "policies": [], "recognition_notes": [],
-    })
-    n_img = add("product_image", 40, 440, {"asset_id": None, "asset_role": "product", "filename": ""})
-    n_strat = add("strategy", 360, 220, {"strategies": [], "task_brief": {"goal": "", "channel": "", "audience": ""}})
-    edge(n_facts, "facts", n_strat, "facts", "锁定产品事实")
+    facts = add("product_facts", 40, 220, NODE_DEFAULTS["product_facts"]) if sk["facts"] else None
+    img = add("product_image", 40, 440, NODE_DEFAULTS["product_image"]) if sk["image"] else None
+    strat = add("strategy", 360, 220, NODE_DEFAULTS["strategy"])
     prompts, gens = [], []
-    for i in range(3):
-        np_ = add("image_prompt", 680, 80 + i * 200, {"prompt": "", "negative_prompt": "", "strategy_ref": f"hero_{i+1}"})
-        ng_ = add("image_generation", 1000, 80 + i * 200, {"model_id": "local-poster-compositor", "outputs": []})
+    for i in range(sk["prompts"]):
+        prompt_content = {**NODE_DEFAULTS["image_prompt"], "strategy_ref": f"hero_{i+1}"}
+        np_ = add("image_prompt", 680, 80 + i * 180, prompt_content)
+        ng_ = add("image_generation", 1000, 80 + i * 180, NODE_DEFAULTS["image_generation"])
         prompts.append(np_); gens.append(ng_)
-        edge(n_strat, "strategy", np_, "strategy", "该图策略")
-        edge(n_img, "visual_reference", np_, "visual_reference", "产品参考图")
+        edge(strat, "strategy", np_, "strategy", "该图策略")
+        if img:
+            edge(img, "visual_reference", np_, "visual_reference", "产品参考图")
         edge(np_, "prompt", ng_, "prompt", "提示词")
-    n_rev = add("review", 1320, 220, {"conclusion": "", "issue_tags": []})
-    n_lay = add("layout_export", 1640, 220, {"title": "", "subtitle": "", "approved": False})
+    rev = add("review", 1320, 220, NODE_DEFAULTS["review"]) if sk["review"] else None
+    lay = add("layout_export", 1640, 220, NODE_DEFAULTS["layout_export"])
+    if facts:
+        edge(facts, "facts", strat, "facts", "锁定产品事实")
     for ng_ in gens:
-        edge(ng_, "generated_asset", n_rev, "generated_asset", "生成结果")
-    edge(n_rev, "review", n_lay, "review", "审核通过")
+        if rev:
+            edge(ng_, "generated_asset", rev, "generated_asset", "生成结果")
+    if rev:
+        edge(rev, "review", lay, "review", "审核通过")
     db.execute("UPDATE graphs SET current_version=current_version+1 WHERE id=?", (g["id"],))
-    return {"ok": True, "graph_id": g["id"], "nodes": {"facts": n_facts, "image": n_img, "strategy": n_strat,
-                                                      "prompts": prompts, "gens": gens, "review": n_rev, "layout": n_lay}}
+    return {"ok": True, "graph_id": g["id"], "nodes": {"facts": facts, "image": img, "strategy": strat, "prompts": prompts, "gens": gens, "review": rev, "layout": lay}}
+
+
+# ---------------- 工作流节点自由增删 ----------------
+NODE_NAMES = {
+    "product_facts": "产品事实卡", "product_image": "产品素材", "strategy": "视觉策略",
+    "image_prompt": "单图提示词", "image_generation": "生图节点", "review": "审核", "layout_export": "分层排版导出",
+}
+
+NODE_DEFAULTS = {
+    "product_facts": {"product_id": "", "product_name": "", "activity_version": "", "confirmed_selling_points": [], "locked_appearance": [], "applicable_scenes": [], "forbidden_expressions": [], "policies": [], "recognition_notes": []},
+    "product_image": {"asset_id": None, "asset_role": "product", "filename": ""},
+    "strategy": {"strategies": [], "task_brief": {"goal": "", "channel": "", "audience": ""}},
+    "image_prompt": {"prompt": "", "negative_prompt": "", "strategy_ref": "hero_1"},
+    "image_generation": {"model_id": "local-poster-compositor", "outputs": []},
+    "review": {"conclusion": "", "issue_tags": []},
+    "layout_export": {"title": "", "subtitle": "", "approved": False},
+}
+
+
+class NodeAdd(BaseModel):
+    type: str
+    x: float = 0
+    y: float = 0
+
+
+@app.post("/api/graphs/{gid}/nodes")
+def add_node(gid: str, body: NodeAdd):
+    g = db.query_one("SELECT id FROM graphs WHERE id=?", (gid,))
+    if not g:
+        raise HTTPException(404, "图不存在")
+    if body.type not in NODE_DEFAULTS:
+        raise HTTPException(422, "未知节点类型")
+    nid = db.gen_id(body.type[:4])
+    db.execute("INSERT INTO nodes(id,graph_id,type,name,position_json,current_version,status) VALUES(?,?,?,?,?,1,'draft')",
+               (nid, gid, body.type, NODE_NAMES.get(body.type, body.type), json.dumps({"x": body.x, "y": body.y})))
+    set_node_version(nid, NODE_DEFAULTS[body.type], author_type="human")
+    return {"id": nid, "type": body.type}
+
+
+@app.delete("/api/nodes/{nid}")
+def delete_node(nid: str):
+    db.execute("DELETE FROM edges WHERE from_node=? OR to_node=?", (nid, nid))
+    db.execute("DELETE FROM node_versions WHERE node_id=?", (nid,))
+    db.execute("DELETE FROM node_candidates WHERE node_id=?", (nid,))
+    db.execute("DELETE FROM nodes WHERE id=?", (nid,))
+    return {"ok": True}
 
 
 # ---------------- nodes ----------------
@@ -419,6 +551,7 @@ class NodePatch(BaseModel):
     content: Optional[dict] = None
     position: Optional[dict] = None
     status: Optional[str] = None
+    name: Optional[str] = None
 
 
 @app.patch("/api/nodes/{nid}")
@@ -430,6 +563,8 @@ def patch_node(nid: str, body: NodePatch):
         db.execute("UPDATE nodes SET position_json=? WHERE id=?", (json.dumps(body.position), nid))
     if body.status is not None:
         db.execute("UPDATE nodes SET status=? WHERE id=?", (body.status, nid))
+    if body.name is not None:
+        db.execute("UPDATE nodes SET name=? WHERE id=?", (body.name, nid))
     return {"ok": True, "version": db.query_one("SELECT current_version FROM nodes WHERE id=?", (nid,))["current_version"]}
 
 
@@ -513,18 +648,32 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
     if ntype == "strategy":
         facts = get_upstream_facts(node_id)
         brief = get_current_version(node_id).get("task_brief", {}) or {}
-        strat = text_gen.generate_strategy(facts, brief)
+        prov = registry.resolve_provider(model_id or "rule-based-planner")
+        if prov:
+            try:
+                strat = text_gen.generate_strategy_llm(model_id, prov, facts, brief)
+            except Exception:
+                strat = text_gen.generate_strategy(facts, brief)
+        else:
+            strat = text_gen.generate_strategy(facts, brief)
         set_node_version(node_id, strat, author_type="ai", model_id=model_id or "rule-based-planner")
-        return {"outputs": [], "usage": {"model": "rule-based-planner"}, "provider_task_id": "strat"}
+        return {"outputs": [], "usage": {"model": model_id or "rule-based-planner"}, "provider_task_id": "strat"}
     if ntype == "image_prompt":
         facts = get_upstream_facts(node_id)
         strat = get_upstream_strategy(node_id)
         baseline = (strat or {}).get("visual_baseline", {})
         sref = get_current_version(node_id).get("strategy_ref", "hero_1")
         item = next((s for s in strat.get("strategies", []) if s["id"] == sref), strat.get("strategies", [{}])[0] if strat.get("strategies") else {})
-        prompt = text_gen.generate_prompt(item, facts, baseline=baseline)
+        prov = registry.resolve_provider(model_id or "rule-based-planner")
+        if prov:
+            try:
+                prompt = text_gen.generate_prompt_llm(model_id, prov, item, facts, baseline=baseline)
+            except Exception:
+                prompt = text_gen.generate_prompt(item, facts, baseline=baseline)
+        else:
+            prompt = text_gen.generate_prompt(item, facts, baseline=baseline)
         set_node_version(node_id, prompt, author_type="ai", model_id=model_id or "rule-based-planner")
-        return {"outputs": [], "usage": {"model": "rule-based-planner"}, "provider_task_id": "prompt"}
+        return {"outputs": [], "usage": {"model": model_id or "rule-based-planner"}, "provider_task_id": "prompt"}
     if ntype == "image_generation":
         pid = get_project_of_node(node_id)
         prompt_content = get_current_version(node_id)
@@ -537,11 +686,13 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
         ar = params.get("aspect_ratio") or pc.get("requested_aspect_ratio", "1:1")
         refs = []
         if img_node:
-            ia = get_current_version(img_node).get("asset_id")
-            if ia:
-                refs.append(ia)
+            ic = get_current_version(img_node) or {}
+            cands = ([ic.get("asset_id")] if ic.get("asset_id") else []) + (ic.get("reference_asset_ids") or [])
+            for ia in cands:
+                if ia and db.query_one("SELECT id FROM assets WHERE id=? AND project_id=?", (ia, pid)):
+                    refs.append(ia)
         for rid in ref_asset_ids:
-            if db.query_one("SELECT id FROM assets WHERE id=? AND project_id=?", (rid, pid)):
+            if rid and db.query_one("SELECT id FROM assets WHERE id=? AND project_id=?", (rid, pid)):
                 refs.append(rid)
         # 校验模型能力
         errs = registry.validate_image_params(model_id, {"aspect_ratio": ar, "count": params.get("count", 1),
@@ -559,7 +710,9 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
                "resolution_tier": params.get("resolution_tier", "standard"),
                "count": params.get("count", 1), "seed": params.get("seed"),
                "params": {"title": params.get("title", ""), "subtitle": params.get("subtitle", "") }}
-        res = image_gen.dispatch(model_id, req, pil_imgs)
+        prov_cfg = registry.resolve_provider(model_id)
+        adapter = (registry.get_model(model_id) or {}).get("adapter")
+        res = image_gen.dispatch(model_id, req, pil_imgs, provider_cfg=prov_cfg, adapter=adapter)
         outputs = []
         for o in res["outputs"]:
             aid = db.gen_id("ast")
@@ -736,6 +889,8 @@ class ModelCreate(BaseModel):
     enabled: int = 1
     cost_policy: str = "free_local"
     workflow_version: str = "v1"
+    provider_id: Optional[str] = None
+    adapter: Optional[str] = None
 
 
 class ModelUpdate(BaseModel):
@@ -746,6 +901,8 @@ class ModelUpdate(BaseModel):
     enabled: Optional[int] = None
     cost_policy: Optional[str] = None
     workflow_version: Optional[str] = None
+    provider_id: Optional[str] = None
+    adapter: Optional[str] = None
 
 
 @app.post("/api/models", status_code=201)
@@ -778,6 +935,49 @@ def update_model_api(model_id: str, patch: ModelUpdate):
 @app.delete("/api/models/{model_id}")
 def delete_model_api(model_id: str):
     registry.delete_model(model_id)
+    return {"ok": True}
+
+
+# ---------------- providers ---------------- 
+class ProviderCreate(BaseModel):
+    id: Optional[str] = None
+    name: str
+    base_url: str = ""
+    api_key: str = ""
+    enabled: int = 1
+
+
+class ProviderUpdate(BaseModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    enabled: Optional[int] = None
+
+
+@app.get("/api/providers")
+def list_providers_api():
+    return registry.list_providers()
+
+
+@app.post("/api/providers", status_code=201)
+def create_provider_api(p: ProviderCreate):
+    try:
+        return registry.create_provider(p.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/providers/{pid}")
+def update_provider_api(pid: str, patch: ProviderUpdate):
+    prov = registry.update_provider(pid, patch.model_dump(exclude_unset=True))
+    if not prov:
+        raise HTTPException(404, "服务商不存在")
+    return prov
+
+
+@app.delete("/api/providers/{pid}")
+def delete_provider_api(pid: str):
+    registry.delete_provider(pid)
     return {"ok": True}
 
 

@@ -1,4 +1,4 @@
-import { Asset, GraphData, ModelInfo, WBNode } from './types'
+import { Asset, GraphData, ModelInfo, Provider, WBNode } from './types'
 
 const BASE = ''
 
@@ -14,9 +14,12 @@ export const api = {
   listProjects: () => fetch(`${BASE}/api/projects`).then(j<any[]>),
   createProject: (name: string) =>
     fetch(`${BASE}/api/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).then(j<any>),
+  renameProject: (id: string, name: string) =>
+    fetch(`${BASE}/api/projects/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).then(j<any>),
   deleteProject: (id: string) => fetch(`${BASE}/api/projects/${id}`, { method: 'DELETE' }).then(j<any>),
 
-  initTemplate: (pid: string) => fetch(`${BASE}/api/projects/${pid}/graph/init-template`, { method: 'POST' }).then(j<any>),
+  initTemplate: (pid: string, skeleton?: string) =>
+    fetch(`${BASE}/api/projects/${pid}/graph/init-template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ skeleton: skeleton || 'poster' }) }).then(j<any>),
 
   getGraph: (pid: string) => fetch(`${BASE}/api/projects/${pid}/graph`).then(j<GraphData>),
   patchGraph: (pid: string, body: any) =>
@@ -24,6 +27,8 @@ export const api = {
 
   getNode: (nid: string) => fetch(`${BASE}/api/nodes/${nid}`).then(j<WBNode>),
   patchNode: (nid: string, body: any) => fetch(`${BASE}/api/nodes/${nid}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  renameNode: (nid: string, name: string) =>
+    fetch(`${BASE}/api/nodes/${nid}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).then(j<any>),
   aiEdit: (nid: string, instruction: string) =>
     fetch(`${BASE}/api/nodes/${nid}/ai-edit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instruction }) }).then(j<any>),
   applyCandidate: (nid: string, candidate_id: string, base_version: number) =>
@@ -42,11 +47,33 @@ export const api = {
     fetch(`${BASE}/api/models/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<ModelInfo>),
   deleteModel: (id: string) => fetch(`${BASE}/api/models/${id}`, { method: 'DELETE' }).then(j<any>),
 
+  addNode: (gid: string, body: any) =>
+    fetch(`${BASE}/api/graphs/${gid}/nodes`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  deleteNode: (nid: string) => fetch(`${BASE}/api/nodes/${nid}`, { method: 'DELETE' }).then(j<any>),
+
+  listProviders: () => fetch(`${BASE}/api/providers`).then(j<Provider[]>),
+  createProvider: (body: any) =>
+    fetch(`${BASE}/api/providers`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<Provider>),
+  updateProvider: (id: string, body: any) =>
+    fetch(`${BASE}/api/providers/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<Provider>),
+  deleteProvider: (id: string) => fetch(`${BASE}/api/providers/${id}`, { method: 'DELETE' }).then(j<any>),
+
   uploadAsset: (pid: string, file: File, role: string) => {
     const fd = new FormData()
     fd.append('file', file)
     fd.append('role', role)
     return fetch(`${BASE}/api/projects/${pid}/assets`, { method: 'POST', body: fd }).then(j<any>)
+  },
+  uploadAssetsBatch: (pid: string, files: File[], role: string) => {
+    const fd = new FormData()
+    files.forEach((f) => fd.append('files', f))
+    fd.append('role', role)
+    return fetch(`${BASE}/api/projects/${pid}/assets/batch`, { method: 'POST', body: fd }).then(j<any>)
+  },
+  importTextFile: (pid: string, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch(`${BASE}/api/projects/${pid}/files/import`, { method: 'POST', body: fd }).then(j<any>)
   },
   listAssets: (pid: string) => fetch(`${BASE}/api/projects/${pid}/assets`).then(j<Asset[]>),
 

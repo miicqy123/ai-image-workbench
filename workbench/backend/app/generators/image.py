@@ -11,6 +11,9 @@ import io
 import json
 import os
 import random
+import base64
+import time
+import urllib.request
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from .. import db, storage
 
@@ -202,9 +205,13 @@ class CommercialApiAdapter:
         raise NotImplementedError("商业图片 API 适配器未启用：请配置密钥与授权范围后启用，并确保数据出境合规。")
 
 
-def dispatch(model_id: str, req: dict, reference_images: list) -> dict:
+def dispatch(model_id: str, req: dict, reference_images: list, provider_cfg: dict | None = None, adapter: str | None = None) -> dict:
     if model_id == "local-poster-compositor":
         return generate(req, reference_images)
+    if adapter == "image_openai" and provider_cfg:
+        return generate_openai_image(model_id, provider_cfg, req)
+    if adapter == "image_dashscope" and provider_cfg:
+        return generate_dashscope_wanx(model_id, provider_cfg, req)
     if model_id == "comfyui-product-edit":
         return ComfyUIAdapter().generate(req, reference_images)
     if model_id == "api-commercial-image":
@@ -285,3 +292,68 @@ def dispatch_tool(intent: str, asset_ids: list, title: str = "", subtitle: str =
         except ValueError as e:
             raise ValueError(f"意图「{intent}」暂未接入：{e}")
     raise ValueError(f"意图「{intent}」暂未接入可用模型")
+
+
+def _http_json(url: str, payload: dict, key: str, timeout: int = 120) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _size_for(aspect: str) -> str:
+    return {"1:1": "1024x1024", "4:3": "1280x960", "3:4": "960x1280", "16:9": "1280x720"}.get((aspect or "1:1").replace(" ", ""), "1024x1024")
+
+
+def generate_openai_image(model_id: str, provider_cfg: dict, req: dict) -> dict:
+    base = (provider_cfg.get("base_url") or "").rstrip("/")
+    if not base:
+        raise ValueError("服务商未配置 Base URL")
+    size = _size_for(req.get("aspect_ratio", "1:1"))
+    count = max(1, min(int(req.get("count", 1) or 1), 4))
+    data = _http_json(base + "/images/generations",
+                      {"model": model_id, "prompt": req.get("prompt", ""), "size": size, "n": count, "response_format": "b64_json"},
+                      provider_cfg.get("api_key") or "")
+    outputs = []
+    for item in data.get("data", []):
+        b64 = item.get("b64_json")
+        if not b64 and item.get("url"):
+            with urllib.request.urlopen(item["url"], timeout=120) as r:
+                b64 = base64.b64encode(r.read()).decode("utf-8")
+        if b64:
+            outputs.append({"bytes": base64.b64decode(b64), "width": int(size.split("x")[0]), "height": int(size.split("x")[1])})
+    return {"outputs": outputs, "usage": {"provider": provider_cfg.get("name"), "model_id": model_id, "count": len(outputs)},
+            "provider_task_id": "openai_image"}
+
+
+def generate_dashscope_wanx(model_id: str, provider_cfg: dict, req: dict) -> dict:
+    key = provider_cfg.get("api_key") or ""
+    if not key:
+        raise ValueError("通义万相需要配置 API Key")
+    size = _size_for(req.get("aspect_ratio", "1:1")).replace("x", "*")
+    payload = {"model": model_id, "input": {"prompt": req.get("prompt", "")}, "parameters": {"size": size, "n": 1}}
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json", "X-DashScope-Async": "enable"}
+    rq = urllib.request.Request("https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis",
+                                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(rq, timeout=120) as r:
+        task = json.loads(r.read().decode("utf-8"))
+    task_id = task["output"]["task_id"]
+    for _ in range(60):
+        gr = urllib.request.Request("https://dashscope.aliyuncs.com/api/v1/tasks/" + task_id, headers={"Authorization": "Bearer " + key})
+        with urllib.request.urlopen(gr, timeout=120) as r:
+            st = json.loads(r.read().decode("utf-8"))
+        out = st.get("output", {})
+        if out.get("task_status") in ("SUCCEEDED", "FAILED", "CANCELED"):
+            outputs = []
+            for it in out.get("results", []):
+                u = it.get("url")
+                if u:
+                    with urllib.request.urlopen(u, timeout=120) as r:
+                        outputs.append({"bytes": r.read(), "width": 1024, "height": 1024})
+            return {"outputs": outputs, "usage": {"provider": provider_cfg.get("name"), "model_id": model_id, "count": len(outputs)},
+                    "provider_task_id": task_id}
+        time.sleep(1)
+    raise ValueError("通义万相生成超时")
+

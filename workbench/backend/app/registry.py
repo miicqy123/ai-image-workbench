@@ -8,6 +8,22 @@
 import json
 from . import db
 
+SEED_PROVIDERS = [
+    {"id": "prv_openrouter", "name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "api_key": ""},
+    {"id": "prv_dashscope", "name": "阿里云百炼（通义千问/万相）", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": ""},
+    {"id": "prv_zhipu", "name": "智谱AI（GLM/CogView）", "base_url": "https://open.bigmodel.cn/api/paas/v4", "api_key": ""},
+]
+
+SEED_EXTERNAL_MODELS = [
+    {"model_id": "openai/gpt-4o-mini", "provider": "OpenRouter", "provider_id": "prv_openrouter", "adapter": "chat", "modality": "text", "capabilities_json": json.dumps({'image_input_limit': 0, 'aspect_ratios': [], 'resolutions': [], 'max_count': 0, 'editing_modes': [], 'tasks': ['strategy', 'image_prompt']}), "parameter_schema": json.dumps({}), "enabled": 0, "cost_policy": "per_token", "workflow_version": "chat-v1"},
+    {"model_id": "qwen-max", "provider": "阿里云百炼", "provider_id": "prv_dashscope", "adapter": "chat", "modality": "text", "capabilities_json": json.dumps({'image_input_limit': 0, 'aspect_ratios': [], 'resolutions': [], 'max_count': 0, 'editing_modes': [], 'tasks': ['strategy', 'image_prompt']}), "parameter_schema": json.dumps({}), "enabled": 0, "cost_policy": "per_token", "workflow_version": "chat-v1"},
+    {"model_id": "glm-4-flash", "provider": "智谱AI", "provider_id": "prv_zhipu", "adapter": "chat", "modality": "text", "capabilities_json": json.dumps({'image_input_limit': 0, 'aspect_ratios': [], 'resolutions': [], 'max_count': 0, 'editing_modes': [], 'tasks': ['strategy', 'image_prompt']}), "parameter_schema": json.dumps({}), "enabled": 0, "cost_policy": "per_token", "workflow_version": "chat-v1"},
+    {"model_id": "wanx2.1-t2i-turbo", "provider": "阿里云百炼", "provider_id": "prv_dashscope", "adapter": "image_dashscope", "modality": "image", "capabilities_json": json.dumps({'image_input_limit': 4, 'aspect_ratios': ['1:1', '4:3', '3:4', '16:9'], 'resolutions': [{'tier': 'standard', 'min': 1024}], 'max_count': 1, 'editing_modes': [], 'tasks': ['image_generation']}), "parameter_schema": json.dumps({'aspect_ratio': {'type': 'enum', 'enum': ['1:1', '4:3', '3:4', '16:9'], 'default': '1:1'}, 'count': {'type': 'int', 'min': 1, 'max': 1, 'default': 1}}), "enabled": 0, "cost_policy": "per_image", "workflow_version": "wanx-v1"},
+    {"model_id": "cogview-3-flash", "provider": "智谱AI", "provider_id": "prv_zhipu", "adapter": "image_openai", "modality": "image", "capabilities_json": json.dumps({'image_input_limit': 4, 'aspect_ratios': ['1:1', '4:3', '3:4', '16:9'], 'resolutions': [{'tier': 'standard', 'min': 1024}], 'max_count': 1, 'editing_modes': [], 'tasks': ['image_generation']}), "parameter_schema": json.dumps({'aspect_ratio': {'type': 'enum', 'enum': ['1:1', '4:3', '3:4', '16:9'], 'default': '1:1'}, 'count': {'type': 'int', 'min': 1, 'max': 1, 'default': 1}}), "enabled": 0, "cost_policy": "per_image", "workflow_version": "cogview-v1"},
+    {"model_id": "openai/gpt-image-1", "provider": "OpenRouter", "provider_id": "prv_openrouter", "adapter": "image_openai", "modality": "image", "capabilities_json": json.dumps({'image_input_limit': 4, 'aspect_ratios': ['1:1', '4:3', '3:4', '16:9'], 'resolutions': [{'tier': 'standard', 'min': 1024}], 'max_count': 1, 'editing_modes': [], 'tasks': ['image_generation']}), "parameter_schema": json.dumps({'aspect_ratio': {'type': 'enum', 'enum': ['1:1', '4:3', '3:4', '16:9'], 'default': '1:1'}, 'count': {'type': 'int', 'min': 1, 'max': 1, 'default': 1}}), "enabled": 0, "cost_policy": "per_image", "workflow_version": "image-v1"}
+]
+
+
 SEED_MODELS = [
     {
         "model_id": "rule-based-planner",
@@ -94,15 +110,23 @@ SEED_MODELS = [
 ]
 
 
+def seed_providers():
+    for p in SEED_PROVIDERS:
+        if not db.query_one("SELECT id FROM providers WHERE id=?", (p["id"],)):
+            db.execute("INSERT INTO providers(id,name,base_url,api_key,enabled,created_at) VALUES(?,?,?,?,1,?)",
+                       (p["id"], p["name"], p["base_url"], p["api_key"], db.now()))
+
+
 def seed_models():
-    for m in SEED_MODELS:
+    seed_providers()
+    for m in SEED_MODELS + SEED_EXTERNAL_MODELS:
         exists = db.query_one("SELECT model_id FROM model_registry WHERE model_id=?", (m["model_id"],))
         if not exists:
             db.execute(
-                "INSERT INTO model_registry(model_id,provider,modality,capabilities_json,parameter_schema,enabled,cost_policy,workflow_version) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO model_registry(model_id,provider,modality,capabilities_json,parameter_schema,enabled,cost_policy,workflow_version,provider_id,adapter) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (m["model_id"], m["provider"], m["modality"], m["capabilities_json"], m["parameter_schema"],
-                 m["enabled"], m["cost_policy"], m["workflow_version"]),
+                 m["enabled"], m["cost_policy"], m["workflow_version"], m.get("provider_id"), m.get("adapter")),
             )
 
 
@@ -177,10 +201,11 @@ def create_model(m: dict) -> dict:
     cap = _as_json_str(m.get("capabilities_json"), "capabilities_json")
     ps = _as_json_str(m.get("parameter_schema"), "parameter_schema")
     db.execute(
-        "INSERT INTO model_registry(model_id,provider,modality,capabilities_json,parameter_schema,enabled,cost_policy,workflow_version) "
-        "VALUES(?,?,?,?,?,?,?,?)",
+        "INSERT INTO model_registry(model_id,provider,modality,capabilities_json,parameter_schema,enabled,cost_policy,workflow_version,provider_id,adapter) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (model_id, m.get("provider", "local"), m.get("modality", "image"), cap, ps,
-         _to_int(m.get("enabled", 1), 1), m.get("cost_policy", "free_local"), m.get("workflow_version", "v1")),
+         _to_int(m.get("enabled", 1), 1), m.get("cost_policy", "free_local"), m.get("workflow_version", "v1"),
+         m.get("provider_id"), m.get("adapter")),
     )
     return get_model(model_id)
 
@@ -190,7 +215,7 @@ def update_model(model_id: str, patch: dict) -> dict | None:
     if not cur:
         return None
     fields: dict = {}
-    for k in ("provider", "modality", "cost_policy", "workflow_version"):
+    for k in ("provider", "modality", "cost_policy", "workflow_version", "provider_id", "adapter"):
         if k in patch and patch[k] is not None:
             fields[k] = patch[k]
     if "enabled" in patch and patch["enabled"] is not None:
@@ -208,3 +233,58 @@ def update_model(model_id: str, patch: dict) -> dict | None:
 
 def delete_model(model_id: str) -> None:
     db.execute("DELETE FROM model_registry WHERE model_id=?", (model_id,))
+
+
+def resolve_provider(model_id: str) -> dict | None:
+    m = get_model(model_id)
+    if not m:
+        return None
+    pid = m.get("provider_id")
+    if not pid:
+        return None
+    p = db.query_one("SELECT * FROM providers WHERE id=?", (pid,))
+    if not p:
+        return None
+    return {"provider_id": p["id"], "name": p["name"], "base_url": p["base_url"], "api_key": p["api_key"]}
+
+
+def list_providers() -> list:
+    return db.query("SELECT * FROM providers ORDER BY created_at ASC")
+
+
+def get_provider(pid: str) -> dict | None:
+    return db.query_one("SELECT * FROM providers WHERE id=?", (pid,))
+
+
+def create_provider(p: dict) -> dict:
+    name = (p.get("name") or "").strip()
+    if not name:
+        raise ValueError("服务商名称必填")
+    pid = (p.get("id") or "").strip() or db.gen_id("prv")
+    if get_provider(pid):
+        raise ValueError(f"服务商已存在：{pid}")
+    db.execute("INSERT INTO providers(id,name,base_url,api_key,enabled,created_at) VALUES(?,?,?,?,?,?)",
+               (pid, name, p.get("base_url", ""), p.get("api_key", ""), _to_int(p.get("enabled", 1), 1), db.now()))
+    return get_provider(pid)
+
+
+def update_provider(pid: str, patch: dict) -> dict | None:
+    if not get_provider(pid):
+        return None
+    fields = {}
+    for k in ("name", "base_url", "api_key"):
+        if k in patch and patch[k] is not None:
+            fields[k] = patch[k]
+    if "enabled" in patch and patch["enabled"] is not None:
+        fields["enabled"] = _to_int(patch["enabled"], 1)
+    if not fields:
+        return get_provider(pid)
+    setclause = ", ".join(f"{k}=?" for k in fields)
+    db.execute(f"UPDATE providers SET {setclause} WHERE id=?", tuple(fields.values()) + (pid,))
+    return get_provider(pid)
+
+
+def delete_provider(pid: str) -> None:
+    db.execute("DELETE FROM providers WHERE id=?", (pid,))
+    db.execute("UPDATE model_registry SET provider_id=NULL WHERE provider_id=?", (pid,))
+

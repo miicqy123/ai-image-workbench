@@ -31,3 +31,6 @@ Thumbs.db
 
 # 服务运行日志
 _server_*.log
+
+# scratch logs
+_*.log

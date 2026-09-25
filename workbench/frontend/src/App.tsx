@@ -31,7 +31,7 @@ const PORT_MAP: Record<string, { from: string; to: string }> = {
   'review>layout_export': { from: 'review', to: 'review' },
 }
 
-interface RFNodeData { node: WBNode; intents?: any[]; tool?: (nodeId: string, intent: string, assetId: string, title: string, subtitle: string) => Promise<void>; toast?: (m: string) => void; refresh?: () => void }
+interface RFNodeData { node: WBNode; intents?: any[]; tool?: (nodeId: string, intent: string, assetId: string, title: string, subtitle: string) => Promise<void>; toast?: (m: string) => void; refresh?: () => void; rename?: (nid: string, name: string) => void }
 
 const IMG_NODE_TYPES = ['image_generation', 'product_image', 'layout_export']
 
@@ -47,6 +47,8 @@ function WBNodeComp({ data, selected }: { data: RFNodeData; selected?: boolean }
   const [et, setEt] = useState('')
   const [es, setEs] = useState('')
   const [running, setRunning] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [nameDraft, setNameDraft] = useState('')
   const isImgNode = IMG_NODE_TYPES.includes(n.type)
   const baseAsset = outputs[0] || n.content?.asset_id
 
@@ -81,10 +83,25 @@ function WBNodeComp({ data, selected }: { data: RFNodeData; selected?: boolean }
   const intentMap = Object.fromEntries(intents.map((i) => [i.intent, i]))
   const enabled = (name: string) => (intentMap[name]?.available ?? false)
 
+  const commitRename = () => {
+    const v = nameDraft.trim()
+    if (v && v !== (n.name || NODE_LABELS[n.type])) data.rename?.(n.id, v)
+    setRenaming(false)
+  }
+
   return (
     <div className={`wb-node ${selected ? 'selected' : ''}`} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}>
       <div className="nh" style={{ background: color }}>
-        <span>{NODE_LABELS[n.type] || n.type}</span>
+        {renaming ? (
+          <input className="node-title-input" autoFocus value={nameDraft} onChange={(e) => setNameDraft(e.target.value)}
+            onBlur={commitRename} onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setRenaming(false) }}
+            onPointerDown={(e) => e.stopPropagation()} />
+        ) : (
+          <span className="node-title" title="双击重命名"
+            onDoubleClick={(e) => { e.stopPropagation(); setNameDraft(n.name || NODE_LABELS[n.type] || n.type); setRenaming(true) }}>
+            {n.name || NODE_LABELS[n.type] || n.type}
+          </span>
+        )}
         <span className={`tag status-${n.status}`}>{n.status}</span>
       </div>
       <div className="nb">
@@ -126,11 +143,20 @@ function WBNodeComp({ data, selected }: { data: RFNodeData; selected?: boolean }
     </div>
   )
 }
+const NODE_PALETTE = [
+  { type: 'product_facts', label: '产品事实' },
+  { type: 'product_image', label: '产品图' },
+  { type: 'strategy', label: '策略' },
+  { type: 'image_prompt', label: '提示词' },
+  { type: 'image_generation', label: '生图' },
+  { type: 'review', label: '审核' },
+  { type: 'layout_export', label: '导出' },
+]
 const nodeTypes = { wb: WBNodeComp }
 
-function toRF(graph: GraphData, intents: any[], tool: any, toast: any, refresh: any) {
+function toRF(graph: GraphData, intents: any[], tool: any, toast: any, refresh: any, rename: any) {
   const nodes = graph.nodes.map((n) => ({
-    id: n.id, type: 'wb', position: n.position, data: { node: n, intents, tool, toast, refresh },
+    id: n.id, type: 'wb', position: n.position, data: { node: n, intents, tool, toast, refresh, rename },
   }))
   const edges = graph.edges.map((e: WBEdge) => ({
     id: e.id, source: e.from_node, target: e.to_node, label: e.semantic,
@@ -139,7 +165,35 @@ function toRF(graph: GraphData, intents: any[], tool: any, toast: any, refresh: 
   return { nodes, edges }
 }
 
-export default function App() {
+function Icon({ d }: { d: string }) {
+  return <svg width={19} height={19} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>
+}
+
+function LeftNav({ onBack, onAddNode, onRun, onModels }: { onBack?: () => void; onAddNode: (t: string) => void; onRun: () => void; onModels: () => void }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="left-nav">
+      <button className="ln-btn" title="返回汇总" onClick={onBack}><Icon d="M15 18l-6-6 6-6" /></button>
+      <button className="ln-btn" title="素材库" onClick={() => { const el = document.querySelector('.sidebar'); el?.scrollIntoView({ behavior: 'smooth' }) }}><Icon d="M3 5h18v14H3zM8 9l3 3 3-3" /></button>
+      <div className="ln-wrap">
+        <button className={`ln-btn ${open ? 'on' : ''}`} title="新增节点" onClick={() => setOpen((v) => !v)}><Icon d="M12 5v14M5 12h14" /></button>
+        {open && (
+          <div className="ln-menu">
+            {NODE_PALETTE.map((n) => <button key={n.type} onClick={() => { onAddNode(n.type); setOpen(false) }}>+ {n.label}</button>)}
+          </div>
+        )}
+      </div>
+      <button className="ln-btn" title="一键运行" onClick={onRun}><Icon d="M6 4l14 8-14 8z" /></button>
+      <button className="ln-btn" title="模型管理" onClick={onModels}><Icon d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" /></button>
+      <div className="ln-sep" />
+      <button className="ln-btn disabled" title="文字（待接入）"><Icon d="M4 6V4h16v2M12 4v16m-3 0h6" /></button>
+      <button className="ln-btn disabled" title="图形（待接入）"><Icon d="M4 6h16M4 6v12M4 18h16M20 6v12" /></button>
+      <button className="ln-btn disabled" title="便签（待接入）"><Icon d="M5 3h14a2 2 0 0 1 2 2v8l-6 6H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM13 19v-6h6" /></button>
+    </div>
+  )
+}
+
+export default function App({ templateName, skeleton, onBack }: { templateName?: string; skeleton?: string; onBack?: () => void } = {}) {
   const [projects, setProjects] = useState<any[]>([])
   const [pid, setPid] = useState<string>('')
   const [graph, setGraph] = useState<GraphData | null>(null)
@@ -160,6 +214,7 @@ export default function App() {
   const [defText, setDefText] = useState('')
   const [defImage, setDefImage] = useState('')
   const [intents, setIntents] = useState<any[]>([])
+  const [importedText, setImportedText] = useState('')
 
   const selected = useMemo(() => graph?.nodes.find((n) => n.id === selectedId) || null, [graph, selectedId])
 
@@ -175,7 +230,7 @@ export default function App() {
     if (!pid) return
     const g = await api.getGraph(pid)
     setGraph(g)
-    const { nodes, edges } = toRF(g, intents, runImageTool, showToast, () => { refreshGraph(); refreshAssets() })
+    const { nodes, edges } = toRF(g, intents, runImageTool, showToast, () => { refreshGraph(); refreshAssets() }, renameNode)
     setRfNodes(nodes)
     setRfEdges(edges)
   }, [pid, setRfNodes, setRfEdges, intents])
@@ -205,15 +260,27 @@ export default function App() {
   }, [pid, rfInstance])
 
   const newProject = async () => {
-    const name = prompt('项目名称（如：XX产品 618 主图）', '示例产品 · 营销主图')
+    const name = prompt('项目名称（如：XX产品 618 主图）', templateName || '示例产品 · 营销主图')
     if (!name) return
     const p = await api.createProject(name)
     setProjects((ps) => [p, ...ps]); setPid(p.id)
-    await api.initTemplate(p.id); await refreshGraph(); await refreshAssets()
+    await api.initTemplate(p.id, skeleton || 'poster'); await refreshGraph(); await refreshAssets()
     showToast('已创建项目并初始化三图模板')
   }
 
-  const initTpl = async () => { if (!pid) return; await api.initTemplate(pid); await refreshGraph(); showToast('已重置为三图模板') }
+  const initTpl = async () => { if (!pid) return; await api.initTemplate(pid, skeleton || 'poster'); await refreshGraph(); showToast('已重置为模板工作流') }
+
+  const addNode = async (type: string) => {
+    if (!pid || !graph) return
+    await api.addNode(graph.graph_id, { type, x: 260 + Math.random() * 260, y: 140 + Math.random() * 260 })
+    await refreshGraph(); showToast('已添加节点')
+  }
+
+  const deleteSelected = async () => {
+    if (!pid || !selectedId) return
+    await api.deleteNode(selectedId)
+    setSelectedId(''); await refreshGraph(); showToast('已删除节点')
+  }
 
   const onConnect = useCallback(async (c: any) => {
     if (!graph || !pid) return
@@ -248,12 +315,35 @@ export default function App() {
     } catch (e: any) { setBusy(false); showToast('错误：' + e.message) }
   }
 
+  const runOne = (nid: string, model_id?: string, params: any = {}) => new Promise<void>((resolve) => {
+    api.runNode(nid, { model_id, params, idempotency_key: `idem_${nid}_${Date.now()}` }).then((r) => {
+      const es = new EventSource(`/api/runs/${r.run_id}/events`)
+      const done = () => { es.close(); resolve() }
+      es.onmessage = (ev) => { try { const d = JSON.parse(ev.data); if (d.event === 'succeeded' || d.event === 'failed') done() } catch { done() } }
+      es.onerror = () => done()
+    }).catch(() => resolve())
+  })
+
+  const runAll = async () => {
+    if (!graph || !pid) return
+    setBusy(true)
+    try {
+      const byType = (t: string) => graph.nodes.filter((n) => n.type === t).map((n) => n.id)
+      const seq = [...byType('strategy'), ...byType('image_prompt'), ...byType('image_generation')]
+      for (const nid of seq) await runOne(nid)
+      await refreshGraph(); await refreshAssets()
+      showToast('工作流逐环节运行完成')
+    } finally { setBusy(false) }
+  }
+
   // —— 事实卡保存 ——
   const saveFacts = async (content: any) => {
     if (!selected) return
     await api.patchNode(selected.id, { content })
     await refreshGraph(); showToast('事实卡已保存')
   }
+
+  const renameNode = async (nid: string, name: string) => { await api.renameNode(nid, name); await refreshGraph() }
 
   const runImageTool = async (nodeId: string, intent: string, assetId: string, title: string, subtitle: string) => {
     const r = await api.runImageTool(nodeId, intent, { asset_id: assetId, title, subtitle })
@@ -275,9 +365,10 @@ export default function App() {
   return (
     <div className="wb-root">
       <div className="topbar">
-        <h1>AI 多节点产品营销生图工作台</h1>
+        <h1>AI 多节点产品营销生图工作台{templateName ? ` · ${templateName}` : ''}</h1>
         <button className="btn primary" onClick={newProject}>+ 新建项目</button>
         <button className="btn" disabled={!pid} onClick={initTpl}>重置模板</button>
+        <button className="btn primary" disabled={!pid || busy} onClick={runAll}>一键运行</button>
         <div className="spacer" />
         <button className="btn ghost" disabled={!pid} onClick={() => { if (pid) window.open(api.exportPackage(pid)) }}>导出素材包</button>
         <button className="btn ghost" disabled={!pid} onClick={() => { if (pid) api.exportProject(pid).then((d) => downloadJson(d, `${pid}.json`)) }}>导出项目JSON</button>
@@ -286,22 +377,32 @@ export default function App() {
       </div>
 
       <div className="body">
+        <LeftNav onBack={onBack} onAddNode={addNode} onRun={runAll} onModels={() => setShowModelMgr(true)} />
         <div className="sidebar">
           <h3>项目</h3>
           {projects.map((p) => (
-            <div key={p.id} className={`proj-item ${p.id === pid ? 'active' : ''}`} onClick={() => setPid(p.id)}>
-              {p.name}
+            <div key={p.id} className={`proj-item ${p.id === pid ? 'active' : ''}`} onClick={() => setPid(p.id)}
+              onDoubleClick={async () => { const n = prompt('重命名项目', p.name); if (n && n.trim()) { await api.renameProject(p.id, n.trim()); await refreshProjects(); showToast('已重命名') } }}>
+              <span className="proj-name">{p.name}</span>
+              <button className="proj-del" title="删除项目" onClick={(e) => { e.stopPropagation(); if (confirm(`删除项目「${p.name}」？该操作不可恢复。`)) { api.deleteProject(p.id).then(() => { if (p.id === pid) { setPid(''); setGraph(null) }; refreshProjects() }) } }}>×</button>
             </div>
           ))}
           {!projects.length && <div className="meta" style={{ padding: '8px 14px' }}>点击「新建项目」开始</div>}
 
           <h3>素材库</h3>
           {pid && (
-            <label className="btn" style={{ margin: '0 14px 8px', display: 'inline-block' }}>
-              上传素材
-              <input type="file" accept="image/*" style={{ display: 'none' }}
-                onChange={async (e) => { const f = e.target.files?.[0]; if (f) { await api.uploadAsset(pid, f, 'product'); await refreshAssets(); showToast('已上传') } }} />
-            </label>
+            <>
+              <label className="btn" style={{ margin: '0 14px 8px', display: 'inline-block' }}>
+                上传素材（可多选）
+                <input type="file" accept="image/*" multiple style={{ display: 'none' }}
+                  onChange={async (e) => { const files = Array.from(e.target.files || []); if (files.length) { await api.uploadAssetsBatch(pid, files, 'product'); await refreshAssets(); showToast(`已上传 ${files.length} 张`) } }} />
+              </label>
+              <label className="btn" style={{ margin: '0 14px 8px', display: 'inline-block' }}>
+                导入文件转文字
+                <input type="file" accept=".txt,.md,.json,.csv,.docx" style={{ display: 'none' }}
+                  onChange={async (e) => { const f = e.target.files?.[0]; if (f) { try { const r = await api.importTextFile(pid, f); setImportedText(r.text); showToast('已导入文字') } catch (err: any) { showToast('失败：' + err.message) } } }} />
+              </label>
+            </>
           )}
           {assets.map((a) => (
             <div className="asset-card" key={a.id}>
@@ -309,6 +410,14 @@ export default function App() {
               <div className="meta">{a.role} · {a.width}×{a.height}</div>
             </div>
           ))}
+
+          <h3>工作流节点</h3>
+          <div className="node-palette">
+            {NODE_PALETTE.map((n) => (
+              <button key={n.type} className="btn" disabled={!pid} onClick={() => addNode(n.type)}>+ {n.label}</button>
+            ))}
+          </div>
+          <button className="btn danger" disabled={!selectedId} onClick={deleteSelected}>删除选中节点</button>
         </div>
 
         <div className="canvas-wrap">
@@ -324,7 +433,8 @@ export default function App() {
               fitView fitViewOptions={{ padding: 0.18 }}
               selectionOnDrag panOnDrag={[1, 2]} selectionMode={SelectionMode.Partial}
               multiSelectionKeyCode={['Meta', 'Control', 'Shift']}
-              deleteKeyCode={null}
+              deleteKeyCode={['Delete', 'Backspace']}
+              onNodesDelete={(del) => { del.forEach((n) => api.deleteNode(n.id)); if (del.some((n) => n.id === selectedId)) setSelectedId(''); refreshGraph() }}
               snapToGrid={snap} snapGrid={[16, 16]}
               onlyRenderVisibleElements
               defaultEdgeOptions={{ type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: '#b0b6bf' } }}>
@@ -341,9 +451,13 @@ export default function App() {
 
         <div className="right">
           {selected ? (
-            <NodePanel key={selected.id} node={selected} pid={pid} assets={assets} models={models} defaultTextModel={defText} defaultImageModel={defImage} onRun={runNode}
-              onSaveFacts={saveFacts} onPatch={async (c) => { await api.patchNode(selected.id, { content: c }); await refreshGraph() }}
-              onRefresh={refreshGraph} showToast={showToast} />
+            <>
+              <input key={selected.id} className="node-name-input" defaultValue={selected.name || NODE_LABELS[selected.type] || selected.type}
+                onBlur={async (e) => { const v = e.target.value.trim(); if (v && v !== (selected.name || NODE_LABELS[selected.type])) { await api.renameNode(selected.id, v); await refreshGraph(); showToast('已重命名节点') } }} />
+              <NodePanel key={selected.id} node={selected} pid={pid} assets={assets} models={models} defaultTextModel={defText} defaultImageModel={defImage} onRun={runNode}
+                onSaveFacts={saveFacts} onPatch={async (c) => { await api.patchNode(selected.id, { content: c }); await refreshGraph() }}
+                onRefresh={refreshGraph} showToast={showToast} />
+            </>
           ) : (
             <div className="muted">点击画布节点查看 / 编辑详情。</div>
           )}
@@ -377,6 +491,23 @@ export default function App() {
           <pre style={{ whiteSpace: 'pre-wrap', maxHeight: 160, overflow: 'auto', fontSize: 11 }}>{JSON.stringify(candidate.content, null, 2)}</pre>
           <button className="btn primary" onClick={applyCand}>应用此候选</button>
           <button className="btn" onClick={() => setCandidate(null)}>丢弃</button>
+        </div>
+      )}
+
+      {importedText && (
+        <div className="candidate-box" style={{ position: 'fixed', right: 720, bottom: 70, width: 340, zIndex: 999 }}>
+          <div className="section-title">导入的文字</div>
+          <pre style={{ whiteSpace: 'pre-wrap', maxHeight: 220, overflow: 'auto', fontSize: 12 }}>{importedText}</pre>
+          <button className="btn" onClick={() => { navigator.clipboard?.writeText(importedText); showToast('已复制') }}>复制</button>
+          <button className="btn primary" onClick={async () => {
+            const fn = graph?.nodes.find((n) => n.type === 'product_facts')
+            if (!fn) { showToast('未找到事实卡'); return }
+            const cur = fn.content || {}
+            const notes = (cur.recognition_notes || []).concat(importedText)
+            await api.patchNode(fn.id, { content: { ...cur, recognition_notes: notes } })
+            await refreshGraph(); setImportedText(''); showToast('已追加到事实卡备注')
+          }}>追加到事实卡备注</button>
+          <button className="btn" onClick={() => setImportedText('')}>关闭</button>
         </div>
       )}
 

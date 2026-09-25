@@ -182,3 +182,67 @@ def text_edit_prompt(node_type: str, base_content: dict, instruction: str) -> tu
         summary.append("已记录指令备注")
 
     return new, "；".join(summary) if summary else "已生成候选修改"
+
+
+import urllib.request
+
+
+def chat_completion(model_id: str, provider_cfg: dict, messages: list, temperature: float = 0.7, json_mode: bool = False) -> str:
+    base = (provider_cfg.get("base_url") or "").rstrip("/")
+    if not base:
+        raise ValueError("服务商未配置 Base URL")
+    key = provider_cfg.get("api_key") or ""
+    payload = {"model": model_id, "messages": messages, "temperature": temperature}
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(base + "/chat/completions",
+                                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                 headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as r:
+        body = json.loads(r.read().decode("utf-8"))
+    return body["choices"][0]["message"]["content"]
+
+
+def _extract_json(s: str) -> dict:
+    s = (s or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:]
+        s = s.strip("`")
+    i = s.find("{"); j = s.rfind("}")
+    if i >= 0 and j > i:
+        s = s[i:j + 1]
+    return json.loads(s)
+
+
+def generate_strategy_llm(model_id: str, provider_cfg: dict, facts: dict, task_brief: dict) -> dict:
+    sys = "你是资深电商营销视觉策划。只输出一个 JSON 对象，不要任何额外解释。"
+    example = {"product_id": "", "task_brief": {"goal": "", "channel": "", "audience": ""},
+               "requirement_summary": "", "visual_baseline": {"palette": [], "material_light": "", "imaging_mode": "", "locked_features": []},
+               "target_aspect": ["1:1", "4:3"],
+               "strategies": [{"id": "hero_1", "role": "主图", "selling_point_id": "", "selling_point_text": "", "audience": "", "scene": "", "composition": "", "aspect_ratio": "1:1", "proposition_proof": "", "scene_options": [], "product_placement": "", "text_modules": {"headline": "", "selling_point": "", "policy": "", "badge": ""}}]}
+    user = ("请把下面的产品事实卡和任务 Brief 生成 3 套差异化视觉策略（strategies 数组固定 3 项，对应 主图/场景图/细节图），"
+            "严格输出与示例同结构的 JSON：\n" + json.dumps({"facts": facts, "task_brief": task_brief}, ensure_ascii=False)
+            + "\n示例结构：" + json.dumps(example, ensure_ascii=False))
+    txt = chat_completion(model_id, provider_cfg, [{"role": "system", "content": sys}, {"role": "user", "content": user}], json_mode=True)
+    data = _extract_json(txt)
+    if not data.get("strategies"):
+        data["strategies"] = generate_strategy(facts, task_brief)["strategies"]
+    return data
+
+
+def generate_prompt_llm(model_id: str, provider_cfg: dict, strategy_item: dict, facts: dict, baseline: dict | None = None) -> dict:
+    sys = "你是商业产品摄影提示词专家。只输出一个 JSON 对象，不要任何额外解释。"
+    user = ("请把下面这张图的策略扩写为中文画面提示词，输出 JSON：{\"prompt\":\"\",\"negative_prompt\":\"\",\"requested_aspect_ratio\":\"\"}。\n"
+            + json.dumps({"strategy": strategy_item, "facts": facts, "baseline": baseline}, ensure_ascii=False))
+    txt = chat_completion(model_id, provider_cfg, [{"role": "system", "content": sys}, {"role": "user", "content": user}], json_mode=True)
+    data = _extract_json(txt)
+    if not data.get("prompt"):
+        raise ValueError("LLM 未返回有效提示词")
+    data.setdefault("requested_aspect_ratio", strategy_item.get("aspect_ratio", "1:1"))
+    return data
+
