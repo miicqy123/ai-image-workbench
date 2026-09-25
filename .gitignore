@@ -1,0 +1,30 @@
+# 内部工具 / Agent 工作日志
+.workbuddy/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 本地数据、上传图与生成图
+*.db
+*.sqlite
+*.sqlite3
+
+# 前端依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 本地环境与凭据
+.env
+.env.*
+!.env.example
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
