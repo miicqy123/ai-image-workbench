@@ -181,6 +181,12 @@ CREATE TABLE IF NOT EXISTS memberships (
 );
 CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(organization_id);
 CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id);
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+    workspace_id TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    revoked_at INTEGER, ip TEXT, user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 """
 
 
@@ -222,6 +228,8 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {ctype}")
         if "template_id" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN template_id TEXT")
+        if "organization_id" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN organization_id TEXT")
         mcols = [r["name"] for r in conn.execute("PRAGMA table_info(model_registry)")]
         for col in ("provider_id", "adapter"):
             if col not in mcols:
@@ -240,7 +248,8 @@ def init_db() -> None:
         conn.commit()
         ucols = [r["name"] for r in conn.execute("PRAGMA table_info(users)")]
         for col, ctype in [("name", "TEXT"), ("email", "TEXT"), ("status", "TEXT DEFAULT 'active'"),
-                           ("organization_id", "TEXT"), ("created_at", "INTEGER")]:
+                           ("organization_id", "TEXT"), ("created_at", "INTEGER"),
+                           ("password_hash", "TEXT"), ("last_login_at", "INTEGER")]:
             if col not in ucols:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ctype}")
         conn.commit()

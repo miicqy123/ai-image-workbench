@@ -4,10 +4,10 @@
 organization_admin / brand_admin / reviewer / editor / viewer），并保留历史别名
 （creator / ops / org_admin / admin / prompt_engineer）以免旧登录态失效。
 
-说明：本层是**软鉴权**。单机演示默认按 super_admin 放行；接入真实登录后，由
-X-WB-Role 头或会话解析出角色，再由 require_permission 强制校验。
+本模块是**纯目录 + 纯判定**（has_permission / permissions_for）。真正的身份解析与
+权限依赖在 services/auth.py：身份只来自服务端会话，客户端无法自报角色。
 """
-from fastapi import Header, HTTPException
+# 本模块只保留纯函数式的角色/权限目录，不依赖 FastAPI。
 
 PERMISSIONS = [
     {"code": "project.create", "name": "创建项目", "area": "creator"},
@@ -82,10 +82,6 @@ def has_permission(role: str | None, perm: str) -> bool:
     return "*" in perms or perm in perms
 
 
-def require_permission(perm: str):
-    """FastAPI 依赖：校验当前请求角色是否具备指定权限。"""
-    def dep(x_wb_role: str | None = Header(None, alias="X-WB-Role")):
-        if not has_permission(x_wb_role, perm):
-            raise HTTPException(403, f"当前角色（{resolve_role(x_wb_role)}）没有 {perm} 权限")
-        return resolve_role(x_wb_role)
-    return dep
+# 注意：这里**不再**提供基于请求头的 require_permission。
+# 早先的实现把 X-WB-Role 请求头当身份来源，属于客户端自报身份（OWASP API5）。
+# 现在唯一的权限依赖入口是 services/auth.py 的 require_permission(actor 权限判定)。

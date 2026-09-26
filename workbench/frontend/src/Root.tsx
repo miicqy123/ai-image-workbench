@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import App from './App'
 import Gallery from './Gallery'
 import DesignCanvas from './DesignCanvas'
@@ -7,18 +7,42 @@ import HomePage from './HomePage'
 import ProjectsPage from './ProjectsPage'
 import LoginPage from './LoginPage'
 import { Template } from './types'
-import { Area, Role, ROLES, canArea, roleName } from './auth'
+import { Area, Role, canArea, roleName } from './auth'
+import { api, Me } from './api'
 
 const DEFAULT_TEMPLATE: Template = { id: 'canvas', name: '自由设计画布', subtitle: '自由排版 / 精修', aspect: '1:1', accent: '#7C3AED', level1: 'design', level2: '自由画布', skeleton: 'poster' }
 
 export default function Root() {
   const [role, setRole] = useState<Role | null>(null)
+  const [me, setMe] = useState<Me | null>(null)
+  const [checking, setChecking] = useState(true)
   const [area, setArea] = useState<Area>('creator')
   const [screen, setScreen] = useState<'home' | 'projects' | 'gallery' | 'design' | 'workflow'>('home')
   const [template, setTemplate] = useState<Template | null>(null)
 
+  const loadMe = async () => {
+    try {
+      const m = await api.authMe()
+      setMe(m)
+      setRole((m.role as Role) || null)
+      setArea(canArea(m.role as Role, 'creator') ? 'creator' : 'admin')
+    } catch {
+      setMe(null); setRole(null)
+    } finally { setChecking(false) }
+  }
+  useEffect(() => { loadMe() }, [])
+
+  const doLogout = async () => {
+    try { await api.authLogout() } catch { /* 忽略 */ }
+    setMe(null); setRole(null); setScreen('home'); setArea('creator')
+  }
+
+  if (checking) {
+    return <div className="login-wrap"><div className="login-card"><p className="muted">正在校验会话…</p></div></div>
+  }
+
   if (!role) {
-    return <LoginPage onLogin={(r) => { setRole(r); setArea(canArea(r, 'creator') ? 'creator' : 'admin') }} />
+    return <LoginPage onLogin={() => { setChecking(true); loadMe() }} />
   }
 
   const canCreator = canArea(role, 'creator')
@@ -48,8 +72,10 @@ export default function Root() {
         {canCreator && <button className={`app-tab ${area === 'creator' ? 'on' : ''}`} onClick={() => setArea('creator')}>创作前台</button>}
         {canAdmin && <button className={`app-tab ${area === 'admin' ? 'on' : ''}`} onClick={() => setArea('admin')}>运营后台</button>}
         <div style={{ flex: 1 }} />
-        <span className="app-role">{roleName(role)}</span>
-        <button className="btn ghost" onClick={() => { setRole(null); setScreen('gallery') }}>退出</button>
+        <span className="app-role" title={me?.organization?.name || ''}>
+          {me?.user?.name || ''}{me ? ` · ${roleName(role)}` : ''}{me?.organization?.name ? ` · ${me.organization.name}` : ''}
+        </span>
+        <button className="btn ghost" onClick={doLogout}>退出</button>
       </div>
       <div className="app-body">
         {area === 'admin' && canAdmin ? <Admin onBack={() => setArea(canCreator ? 'creator' : 'admin')} /> : creatorView}

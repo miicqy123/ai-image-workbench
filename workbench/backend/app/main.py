@@ -12,7 +12,7 @@ import time
 import zipfile
 from collections import defaultdict, deque
 from PIL import Image, ImageDraw
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from pydantic import BaseModel
@@ -29,6 +29,7 @@ from .services import metering
 from .services import compliance
 from .services import notify as notify_svc
 from .services import rbac
+from .services import auth
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -51,20 +52,48 @@ def _is_admin_path(path: str) -> bool:
     return any(path.startswith(p) for p in ADMIN_PATH_PREFIXES)
 
 
+PUBLIC_PATHS = ("/api/health", "/api/auth/login", "/api/auth/bootstrap", "/api/auth/bootstrap-state")
+
+
+def _is_public(path: str) -> bool:
+    return path in PUBLIC_PATHS
+
+
+def _service_token(request) -> str | None:
+    """机器凭据识别：返回 'admin' / 'api' / None。
+
+    这是**服务账号**，不是用户身份，只能由部署方配置的密钥获得；未配置时该通道关闭。
+    """
+    if not (WB_API_TOKEN or WB_ADMIN_TOKEN):
+        return None
+    got = request.headers.get("Authorization", "")
+    if not got:
+        return None
+    if WB_ADMIN_TOKEN and got == f"Bearer {WB_ADMIN_TOKEN}":
+        return "admin"
+    if WB_API_TOKEN and got == f"Bearer {WB_API_TOKEN}":
+        return "api"
+    return None
+
+
+def _protected(path: str) -> bool:
+    return path.startswith("/api") or path.startswith("/files")
+
+
 @app.middleware("http")
 async def auth_middleware(request, call_next):
+    """统一认证入口：/api 与 /files 必须持有有效会话（或显式开启的开发模式）。"""
     path = request.url.path
-    if path == "/api/health":
+    if request.method == "OPTIONS" or _is_public(path) or not _protected(path):
         return await call_next(request)
-    auth = request.headers.get("Authorization", "")
-    # 管理员接口：需 WB_ADMIN_TOKEN
-    if WB_ADMIN_TOKEN and path.startswith("/api") and _is_admin_path(path):
-        if auth != f"Bearer {WB_ADMIN_TOKEN}":
-            return JSONResponse({"detail": "需要管理员 Token"}, status_code=401)
-    # 普通接口：需 WB_API_TOKEN（管理员 Token 亦可）
-    if WB_API_TOKEN and (path.startswith("/api") or path.startswith("/files")):
-        if auth not in (f"Bearer {WB_API_TOKEN}", f"Bearer {WB_ADMIN_TOKEN}"):
-            return JSONResponse({"detail": "未授权：请提供有效的 Bearer Token"}, status_code=401)
+    actor = auth.actor_from_request(request)
+    if actor is None:
+        kind = _service_token(request)
+        if kind:
+            request.state.actor = auth.service_actor(request, admin=(kind == "admin"))
+            return await call_next(request)
+        return JSONResponse({"detail": "未登录或会话已失效"}, status_code=401)
+    request.state.actor = actor
     return await call_next(request)
 
 
@@ -163,11 +192,106 @@ def health():
     return {"status": "ok", "time": db.now()}
 
 
+# ---------------- 认证：唯一可信身份入口 ----------------
+class LoginIn(BaseModel):
+    user_id: str
+    password: str
+
+
+class BootstrapIn(BaseModel):
+    user_id: str = "usr_default"
+    password: str
+    name: Optional[str] = None
+
+
+class PasswordChangeIn(BaseModel):
+    old_password: str
+    new_password: str
+
+
+def _set_session_cookie(resp: JSONResponse, token: str) -> None:
+    resp.set_cookie(auth.SESSION_COOKIE, token, max_age=auth.SESSION_TTL_SECONDS, httponly=True,
+                    samesite="lax", secure=auth.COOKIE_SECURE, path="/")
+
+
+@app.get("/api/auth/bootstrap-state")
+def auth_bootstrap_state():
+    """前端用来判断是否需要首次初始化管理员密码。"""
+    return {"needs_bootstrap": not auth.any_password_configured(), "dev_mode": auth.DEV_AUTH,
+            "env": auth.WB_ENV, "session_ttl": auth.SESSION_TTL_SECONDS}
+
+
+@app.post("/api/auth/bootstrap", status_code=201)
+def auth_bootstrap(body: BootstrapIn):
+    """首次初始化：仅当系统内没有任何用户设置过密码时可用，之后永久关闭。"""
+    if auth.any_password_configured():
+        raise HTTPException(409, "系统已完成初始化，请联系管理员重置密码")
+    if not db.query_one("SELECT id FROM users WHERE id=?", (body.user_id,)):
+        now = int(db.now())
+        db.execute("INSERT INTO users(id,tenant_id,role,name,email,status,organization_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                   (body.user_id, "tnt_default", "super_admin", body.name or body.user_id, "",
+                    "active", "org_default", now))
+    try:
+        auth.set_password(body.user_id, body.password)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    db.audit(None, body.user_id, "auth.bootstrap", body.user_id)
+    token = auth.create_session(body.user_id)
+    resp = JSONResponse({"ok": True, "user_id": body.user_id, "role": "super_admin"}, status_code=201)
+    _set_session_cookie(resp, token)
+    return resp
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginIn, request: Request):
+    token = auth.login(body.user_id, body.password, request)
+    if not token:
+        db.audit(None, body.user_id or "", "auth.login.failed", body.user_id or "")
+        raise HTTPException(401, "用户名或密码错误，或账号已被禁用")
+    actor = auth._build_actor(body.user_id)
+    db.audit(None, body.user_id, "auth.login", body.user_id)
+    resp = JSONResponse({"ok": True, "user_id": body.user_id, "role": actor.role if actor else None})
+    _set_session_cookie(resp, token)
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    auth.revoke_session(request.cookies.get(auth.SESSION_COOKIE) or "")
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(auth.SESSION_COOKIE, path="/")
+    return resp
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    return auth.me(auth.require_actor(request))
+
+
+@app.post("/api/auth/change-password")
+def auth_change_password(body: PasswordChangeIn, request: Request):
+    actor = auth.require_actor(request)
+    u = db.query_one("SELECT password_hash FROM users WHERE id=?", (actor.user_id,))
+    if not auth.verify_password(body.old_password, (u or {}).get("password_hash")):
+        raise HTTPException(401, "原密码不正确")
+    try:
+        auth.set_password(actor.user_id, body.new_password)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    auth.revoke_all_sessions(actor.user_id)
+    db.audit(None, actor.user_id, "auth.password.change", actor.user_id)
+    return {"ok": True, "message": "密码已更新，所有会话已失效，请重新登录"}
+
+
 @app.post("/api/projects")
-def create_project(body: ProjectCreate):
+def create_project(body: ProjectCreate, request: Request):
+    actor = auth.require_actor(request)
     pid = db.gen_id("prj")
-    db.execute("INSERT INTO projects(id,tenant_id,owner_id,name,status,template_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-               (pid, body.tenant_id, "usr_default", body.name, "active", body.template_id, db.now(), db.now()))
+    # 归属来自服务端身份，不再采信请求体里的 tenant_id / owner
+    db.execute("INSERT INTO projects(id,tenant_id,owner_id,name,status,organization_id,template_id,created_at,updated_at) "
+               "VALUES(?,?,?,?,?,?,?,?,?)",
+               (pid, actor.organization_id or body.tenant_id, actor.user_id, body.name, "active",
+                actor.organization_id or body.tenant_id, body.template_id, db.now(), db.now()))
     gid = db.gen_id("grf")
     db.execute("INSERT INTO graphs(id,project_id,current_version) VALUES(?,?,1)", (gid, pid))
     return {"id": pid, "name": body.name, "graph_id": gid}
@@ -1853,7 +1977,7 @@ def admin_org_quota(oid: str):
 
 
 @app.put("/api/admin/organizations/{oid}/quota")
-def admin_update_org_quota(oid: str, body: QuotaIn, _role: str = Depends(rbac.require_permission("org.quota.manage"))):
+def admin_update_org_quota(oid: str, body: QuotaIn, _role: str = Depends(auth.require_permission("org.quota.manage"))):
     o = db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
     if not o:
         raise HTTPException(404, "组织不存在")
@@ -1875,7 +1999,7 @@ def admin_credit_ledger(limit: int = 200):
 
 
 @app.post("/api/admin/credits/grant", status_code=201)
-def admin_credits_grant(body: CreditIn, _role: str = Depends(rbac.require_permission('org.quota.manage'))):
+def admin_credits_grant(body: CreditIn, _role: str = Depends(auth.require_permission('org.quota.manage'))):
     if body.amount <= 0:
         raise HTTPException(422, "补发额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, abs(body.amount),
@@ -1888,7 +2012,7 @@ def admin_credits_grant(body: CreditIn, _role: str = Depends(rbac.require_permis
 
 
 @app.post("/api/admin/credits/deduct", status_code=201)
-def admin_credits_deduct(body: CreditIn, _role: str = Depends(rbac.require_permission('org.quota.manage'))):
+def admin_credits_deduct(body: CreditIn, _role: str = Depends(auth.require_permission('org.quota.manage'))):
     if body.amount <= 0:
         raise HTTPException(422, "扣除额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, -abs(body.amount),
@@ -1901,7 +2025,7 @@ def admin_credits_deduct(body: CreditIn, _role: str = Depends(rbac.require_permi
 
 
 @app.post("/api/admin/credits/refund", status_code=201)
-def admin_credits_refund(body: CreditIn, _role: str = Depends(rbac.require_permission('org.quota.manage'))):
+def admin_credits_refund(body: CreditIn, _role: str = Depends(auth.require_permission('org.quota.manage'))):
     if body.amount <= 0:
         raise HTTPException(422, "退款额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, abs(body.amount),
@@ -2120,17 +2244,17 @@ def review_claim(rid: str, body: ReviewDecisionIn):
 
 
 @app.post("/api/admin/reviews/{rid}/approve")
-def review_approve(rid: str, body: ReviewDecisionIn, _role: str = Depends(rbac.require_permission("review.decide"))):
+def review_approve(rid: str, body: ReviewDecisionIn, _role: str = Depends(auth.require_permission("review.decide"))):
     return _decide_review(rid, "approved", body.reason, body.assigned_to)
 
 
 @app.post("/api/admin/reviews/{rid}/return")
-def review_return(rid: str, body: ReviewDecisionIn, _role: str = Depends(rbac.require_permission("review.decide"))):
+def review_return(rid: str, body: ReviewDecisionIn, _role: str = Depends(auth.require_permission("review.decide"))):
     return _decide_review(rid, "returned", body.reason, body.assigned_to)
 
 
 @app.post("/api/admin/reviews/{rid}/reject")
-def review_reject(rid: str, body: ReviewDecisionIn, _role: str = Depends(rbac.require_permission("review.decide"))):
+def review_reject(rid: str, body: ReviewDecisionIn, _role: str = Depends(auth.require_permission("review.decide"))):
     return _decide_review(rid, "rejected", body.reason, body.assigned_to)
 
 
@@ -2171,7 +2295,7 @@ def admin_permissions():
 
 
 @app.post("/api/admin/organizations", status_code=201)
-def admin_create_organization(body: OrganizationIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_create_organization(body: OrganizationIn, _role: str = Depends(auth.require_permission("member.manage"))):
     oid = body.id or db.gen_id("org")
     if db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
         raise HTTPException(400, "组织 ID 已存在")
@@ -2187,7 +2311,7 @@ def admin_create_organization(body: OrganizationIn, _role: str = Depends(rbac.re
 
 
 @app.put("/api/admin/organizations/{oid}")
-def admin_update_organization(oid: str, body: OrganizationIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_update_organization(oid: str, body: OrganizationIn, _role: str = Depends(auth.require_permission("member.manage"))):
     if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
         raise HTTPException(404, "组织不存在")
     db.execute("UPDATE organizations SET name=?, plan=? WHERE id=?", (body.name, body.plan, oid))
@@ -2204,7 +2328,7 @@ def admin_workspaces(organization_id: Optional[str] = None):
 
 
 @app.post("/api/admin/organizations/{oid}/workspaces", status_code=201)
-def admin_create_workspace(oid: str, body: WorkspaceIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_create_workspace(oid: str, body: WorkspaceIn, _role: str = Depends(auth.require_permission("member.manage"))):
     if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
         raise HTTPException(404, "组织不存在")
     wid = body.id or db.gen_id("wsp")
@@ -2240,7 +2364,7 @@ def _member_rows() -> list:
 
 
 @app.get("/api/admin/users")
-def admin_users(_role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_users(_role: str = Depends(auth.require_permission("member.manage"))):
     return _member_rows()
 
 
@@ -2262,7 +2386,7 @@ def admin_user_usage(uid: str, days: int = 30):
 
 
 @app.post("/api/admin/organizations/{oid}/members", status_code=201)
-def admin_add_member(oid: str, body: MemberIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_add_member(oid: str, body: MemberIn, _role: str = Depends(auth.require_permission("member.manage"))):
     if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
         raise HTTPException(404, "组织不存在")
     known_roles = {r["id"] for r in rbac.roles()} | {al for r in rbac.roles() for al in r["aliases"]}
@@ -2285,7 +2409,7 @@ def admin_add_member(oid: str, body: MemberIn, _role: str = Depends(rbac.require
 
 
 @app.put("/api/admin/memberships/{mid}/role")
-def admin_set_member_role(mid: str, body: RoleAssignIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_set_member_role(mid: str, body: RoleAssignIn, _role: str = Depends(auth.require_permission("member.manage"))):
     m = db.query_one("SELECT * FROM memberships WHERE id=?", (mid,))
     if not m:
         raise HTTPException(404, "成员关系不存在")
@@ -2300,8 +2424,27 @@ def admin_set_member_role(mid: str, body: RoleAssignIn, _role: str = Depends(rba
     return {"membership_id": mid, "user_id": m["user_id"], "role": role}
 
 
+class ResetPasswordIn(BaseModel):
+    new_password: str
+
+
+@app.post("/api/admin/users/{uid}/reset-password")
+def admin_reset_password(uid: str, body: ResetPasswordIn, _actor=Depends(auth.require_permission("member.manage"))):
+    """管理员重置成员密码；重置后该成员所有既有会话立即失效。"""
+    if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
+        raise HTTPException(404, "用户不存在")
+    try:
+        auth.set_password(uid, body.new_password)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    auth.revoke_all_sessions(uid)
+    db.audit(None, _actor.user_id, "member.password.reset", uid)
+    notify_svc.notify(uid, "member", "你的密码已被管理员重置", "请使用新密码登录", ref_type="user", ref_id=uid)
+    return {"ok": True, "user_id": uid}
+
+
 @app.post("/api/admin/users/{uid}/disable")
-def admin_disable_user(uid: str, _role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_disable_user(uid: str, _role: str = Depends(auth.require_permission("member.manage"))):
     if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
         raise HTTPException(404, "用户不存在")
     db.execute("UPDATE users SET status='disabled' WHERE id=?", (uid,))
@@ -2311,7 +2454,7 @@ def admin_disable_user(uid: str, _role: str = Depends(rbac.require_permission("m
 
 
 @app.post("/api/admin/users/{uid}/enable")
-def admin_enable_user(uid: str, _role: str = Depends(rbac.require_permission("member.manage"))):
+def admin_enable_user(uid: str, _role: str = Depends(auth.require_permission("member.manage"))):
     if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
         raise HTTPException(404, "用户不存在")
     db.execute("UPDATE users SET status='active' WHERE id=?", (uid,))

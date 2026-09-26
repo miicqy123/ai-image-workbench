@@ -10,7 +10,27 @@ async function j<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>
 }
 
+export interface Me {
+  user: { id: string; name: string; status: string }
+  role: string
+  role_name: string
+  organization: { id: string; name: string; plan: string } | null
+  memberships: { id: string; workspace_id?: string; organization_id: string; role: string; status: string }[]
+  active_workspace_id?: string
+  permissions: string[]
+  dev_mode: boolean
+}
+
 export const api = {
+  authBootstrapState: () => fetch(`${BASE}/api/auth/bootstrap-state`).then(j<any>),
+  authBootstrap: (body: { user_id: string; password: string; name?: string }) =>
+    fetch(`${BASE}/api/auth/bootstrap`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  authLogin: (body: { user_id: string; password: string }) =>
+    fetch(`${BASE}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  authLogout: () => fetch(`${BASE}/api/auth/logout`, { method: 'POST' }).then(j<any>),
+  authMe: () => fetch(`${BASE}/api/auth/me`).then(j<Me>),
+  changePassword: (body: { old_password: string; new_password: string }) =>
+    fetch(`${BASE}/api/auth/change-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
   listProjects: () => fetch(`${BASE}/api/projects`).then(j<any[]>),
   createProject: (name: string, templateId?: string) =>
     fetch(`${BASE}/api/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, template_id: templateId || null }) }).then(j<any>),
