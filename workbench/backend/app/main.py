@@ -345,6 +345,62 @@ def upsert_brief(pid: str, body: BriefIn):
     return _brief_dict(db.query_one("SELECT * FROM generation_briefs WHERE id=?", (bid,)))
 
 
+# ---------------- 前台工作台 ----------------
+@app.get("/api/creator/dashboard")
+def creator_dashboard():
+    projects = db.query("SELECT id,name,status,created_at FROM projects ORDER BY created_at DESC")
+    jobs = db.query("SELECT project_id,status FROM generation_jobs")
+    briefs = {b["project_id"] for b in db.query("SELECT DISTINCT project_id FROM generation_briefs")}
+    out = []
+    for p in projects:
+        pj = [j for j in jobs if j["project_id"] == p["id"]]
+        if p["status"] == "archived":
+            st = "archived"
+        elif any(j["status"] in ("queued", "running") for j in pj):
+            st = "generating"
+        elif any(j["status"] == "succeeded" for j in pj):
+            st = "completed"
+        else:
+            st = "draft"
+        out.append({**p, "derived_status": st, "has_brief": p["id"] in briefs})
+    by = {}
+    for p in out:
+        by[p["derived_status"]] = by.get(p["derived_status"], 0) + 1
+    return {"count": len(out), "by_status": by, "recent": out[:8], "projects": out}
+
+
+@app.post("/api/projects/{pid}/archive")
+def archive_project(pid: str):
+    db.execute("UPDATE projects SET status='archived', updated_at=? WHERE id=?", (db.now(), pid))
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/restore")
+def restore_project(pid: str):
+    db.execute("UPDATE projects SET status='active', updated_at=? WHERE id=?", (db.now(), pid))
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/duplicate", status_code=201)
+def duplicate_project(pid: str):
+    src = db.query_one("SELECT * FROM projects WHERE id=?", (pid,))
+    if not src:
+        raise HTTPException(404, "项目不存在")
+    npid = db.gen_id("prj")
+    db.execute("INSERT INTO projects(id,tenant_id,owner_id,name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+               (npid, src["tenant_id"], src["owner_id"], src["name"] + " 副本", "active", db.now(), db.now()))
+    gid = db.gen_id("grf")
+    db.execute("INSERT INTO graphs(id,project_id,current_version) VALUES(?,?,1)", (gid, npid))
+    b = db.query_one("SELECT * FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    if b:
+        nb = db.gen_id("brief")
+        db.execute("INSERT INTO generation_briefs(id,project_id,user_prompt,purpose,platform,aspect_ratio,image_count,selected_model_id,selected_prompt_template_id,reference_asset_ids_json,product_asset_ids_json,style_keywords_json,brand_keywords_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (nb, npid, b["user_prompt"], b["purpose"], b["platform"], b["aspect_ratio"], b["image_count"],
+                    b["selected_model_id"], b["selected_prompt_template_id"], b["reference_asset_ids_json"],
+                    b["product_asset_ids_json"], b["style_keywords_json"], b["brand_keywords_json"], int(db.now()), int(db.now())))
+    return {"id": npid, "graph_id": gid}
+
+
 # ---------------- 生图任务（jobs / candidates） ----------------
 class JobIn(BaseModel):
     model_id: Optional[str] = None

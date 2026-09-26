@@ -385,3 +385,22 @@ body {
 .app-tab.on { background: rgba(255,255,255,.18); color: #fff; font-weight: 600; }
 .app-role { font-size: 12px; color: rgba(255,255,255,.8); }
 .app-body { flex: 1; min-height: 0; overflow: auto; }
+
+.creator-wrap { display: flex; flex-direction: column; height: 100%; }
+.creator-subnav { display: flex; gap: 8px; padding: 10px 16px; background: var(--color-surface); border-bottom: 1px solid var(--color-border); }
+.creator-main { flex: 1; min-height: 0; overflow: auto; }
+.page { padding: 24px 32px; max-width: 1120px; margin: 0 auto; }
+.page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.page-head h1 { margin: 0; font-size: 22px; }
+.page-sub { font-size: 15px; margin: 22px 0 10px; display: flex; align-items: center; gap: 8px; }
+.stat-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+.quick-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
+.quick-card { border: 1px solid var(--color-border); background: var(--color-surface); border-radius: 12px; padding: 18px 12px; cursor: pointer; font-size: 13px; color: var(--color-foreground); transition: border-color var(--transition), box-shadow var(--transition); }
+.quick-card:hover { border-color: var(--color-primary); box-shadow: var(--shadow-sm); }
+.proj-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.proj-toolbar input { border: 1px solid var(--color-border-strong); border-radius: 8px; padding: 7px 10px; font-size: 13px; width: 220px; }
+.proj-list { display: flex; flex-direction: column; gap: 8px; }
+.proj-row { display: flex; align-items: center; gap: 10px; border: 1px solid var(--color-border); border-radius: 10px; padding: 10px 12px; }
+.proj-row-name { flex: 1; }
+.proj-actions { display: flex; gap: 6px; }
+.run-draft { background: #E5E7EB; color: #374151; } .run-completed { background: #D1FAE5; color: #047857; } .run-generating { background: #DBEAFE; color: #1D4ED8; } .run-archived { background: #F3F4F6; color: #6B7280; }

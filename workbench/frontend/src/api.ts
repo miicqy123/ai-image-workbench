@@ -87,6 +87,11 @@ export const api = {
   exportPackage: (pid: string) => `${BASE}/api/projects/${pid}/export-package`,
 
   getDefaults: (pid: string) => fetch(`${BASE}/api/projects/${pid}/defaults`).then(j<any>),
+  creatorDashboard: () => fetch(`${BASE}/api/creator/dashboard`).then(j<any>),
+  archiveProject: (pid: string) => fetch(`${BASE}/api/projects/${pid}/archive`, { method: 'POST' }).then(j<any>),
+  restoreProject: (pid: string) => fetch(`${BASE}/api/projects/${pid}/restore`, { method: 'POST' }).then(j<any>),
+  duplicateProject: (pid: string) => fetch(`${BASE}/api/projects/${pid}/duplicate`, { method: 'POST' }).then(j<any>),
+
   createJob: (pid: string, body: any) =>
     fetch(`${BASE}/api/projects/${pid}/generation-jobs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
   getJob: (jid: string) => fetch(`${BASE}/api/generation-jobs/${jid}`).then(j<any>),

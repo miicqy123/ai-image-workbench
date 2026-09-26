@@ -3,6 +3,8 @@ import App from './App'
 import Gallery from './Gallery'
 import DesignCanvas from './DesignCanvas'
 import Admin from './Admin'
+import HomePage from './HomePage'
+import ProjectsPage from './ProjectsPage'
 import LoginPage from './LoginPage'
 import { Template } from './types'
 import { Area, Role, ROLES, canArea, roleName } from './auth'
@@ -12,7 +14,7 @@ const DEFAULT_TEMPLATE: Template = { id: 'canvas', name: '自由设计画布', s
 export default function Root() {
   const [role, setRole] = useState<Role | null>(null)
   const [area, setArea] = useState<Area>('creator')
-  const [screen, setScreen] = useState<'gallery' | 'design' | 'workflow'>('gallery')
+  const [screen, setScreen] = useState<'home' | 'projects' | 'gallery' | 'design' | 'workflow'>('home')
   const [template, setTemplate] = useState<Template | null>(null)
 
   if (!role) {
@@ -22,24 +24,22 @@ export default function Root() {
   const canCreator = canArea(role, 'creator')
   const canAdmin = canArea(role, 'admin')
 
-  const creatorView = (() => {
-    if (screen === 'design' && template) return <DesignCanvas template={template} onBack={() => setScreen('gallery')} />
-    if (screen === 'workflow') {
-      return (
-        <div style={{ position: 'relative', height: '100%' }}>
-          <App templateName={template?.name} skeleton={template?.skeleton} onBack={() => { setTemplate(null); setScreen('gallery') }} />
-        </div>
-      )
-    }
-    return (
-      <Gallery
-        onUse={(t) => { setTemplate(t); setScreen('workflow') }}
-        onWorkflow={() => { setTemplate(null); setScreen('workflow') }}
-        onDesign={() => { setTemplate(DEFAULT_TEMPLATE); setScreen('design') }}
-        onAdmin={canAdmin ? () => setArea('admin') : undefined}
-      />
-    )
-  })()
+  const creatorView = (
+    <div className="creator-wrap">
+      <div className="creator-subnav">
+        <button className={`tag-chip ${screen === 'home' ? 'on' : ''}`} onClick={() => setScreen('home')}>首页</button>
+        <button className={`tag-chip ${screen === 'projects' ? 'on' : ''}`} onClick={() => setScreen('projects')}>我的项目</button>
+        <button className={`tag-chip ${screen === 'gallery' ? 'on' : ''}`} onClick={() => setScreen('gallery')}>模板中心</button>
+      </div>
+      <div className="creator-main">
+        {screen === 'home' ? <HomePage onQuickCreate={() => setScreen('gallery')} onProjects={() => setScreen('projects')} />
+          : screen === 'projects' ? <ProjectsPage onOpen={() => setScreen('workflow')} />
+          : screen === 'design' && template ? <DesignCanvas template={template} onBack={() => setScreen('gallery')} />
+          : screen === 'workflow' ? <div style={{ position: 'relative', height: '100%' }}><App templateName={template?.name} skeleton={template?.skeleton} onBack={() => { setTemplate(null); setScreen('gallery') }} /></div>
+          : <Gallery onUse={(t) => { setTemplate(t); setScreen('workflow') }} onWorkflow={() => { setTemplate(null); setScreen('workflow') }} onDesign={() => { setTemplate(DEFAULT_TEMPLATE); setScreen('design') }} onAdmin={canAdmin ? () => setArea('admin') : undefined} />}
+      </div>
+    </div>
+  )
 
   return (
     <div className="app-shell">
