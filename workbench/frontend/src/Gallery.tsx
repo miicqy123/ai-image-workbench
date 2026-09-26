@@ -46,7 +46,7 @@ interface Props {
   onUse: (t: Template) => void
   onWorkflow: () => void
   onDesign: () => void
-  onAdmin: () => void
+  onAdmin?: () => void
 }
 
 export default function Gallery({ onUse, onWorkflow, onDesign, onAdmin }: Props) {
@@ -65,7 +65,7 @@ export default function Gallery({ onUse, onWorkflow, onDesign, onAdmin }: Props)
         </div>
         <button className="btn primary" onClick={onWorkflow}>进入生图工作流</button>
         <button className="btn" onClick={onDesign}>自由设计画布</button>
-        <button className="btn" onClick={onAdmin}>后台管理</button>
+        {onAdmin && <button className="btn" onClick={onAdmin}>后台管理</button>}
       </header>
 
       <div className="level-tabs">

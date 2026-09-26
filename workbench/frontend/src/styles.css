@@ -374,3 +374,14 @@ body {
 .cand-item.on { border-color: var(--color-primary); box-shadow: var(--ring); }
 .cand-item img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; }
 .cand-actions { display: flex; flex-direction: column; gap: 4px; }
+
+.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--color-background); }
+.login-card { width: 360px; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 16px; padding: 28px; box-shadow: var(--shadow-lg); }
+.login-card h1 { margin: 0 0 4px; font-size: 20px; }
+.app-shell { height: 100vh; display: flex; flex-direction: column; }
+.app-nav { display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: var(--color-foreground); color: #fff; flex: none; }
+.app-brand { font-weight: 700; margin-right: 8px; }
+.app-tab { border: none; background: transparent; color: rgba(255,255,255,.7); padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+.app-tab.on { background: rgba(255,255,255,.18); color: #fff; font-weight: 600; }
+.app-role { font-size: 12px; color: rgba(255,255,255,.8); }
+.app-body { flex: 1; min-height: 0; overflow: auto; }
