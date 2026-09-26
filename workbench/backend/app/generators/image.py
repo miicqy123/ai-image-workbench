@@ -103,6 +103,50 @@ def _fit_product(prod: Image.Image, max_w, max_h) -> Image.Image:
     return prod.resize((nw, nh), Image.LANCZOS)
 
 
+# 本地预览版式契约（比例均相对画布宽高，不写死像素）
+LOCAL_AUX_MAX_W, LOCAL_AUX_MAX_H = 0.22, 0.22      # role=product 第二张：右下辅图上限
+LOCAL_AUX_RIGHT_MARGIN, LOCAL_AUX_BOTTOM = 0.05, 0.72
+LOCAL_LOGO_MAX_W, LOCAL_LOGO_MAX_H = 0.18, 0.12    # role=logo 第一张：左上 Logo 上限
+LOCAL_LOGO_X, LOCAL_LOGO_Y = 0.05, 0.06
+LOCAL_MAX_PRODUCTS, LOCAL_MAX_LOGOS = 2, 1         # 本轮最多渲染两张 product + 一张 logo
+
+
+def _fit_limited(im: Image.Image, max_w: int, max_h: int) -> Image.Image:
+    """等比缩放到不超过 max_w/max_h，且**不放大**原图（小图保持可见尺寸），保留 alpha。"""
+    im = im.convert("RGBA")
+    pw, ph = im.size
+    if pw <= 0 or ph <= 0 or max_w <= 0 or max_h <= 0:
+        return im
+    scale = min(max_w / pw, max_h / ph, 1.0)
+    nw, nh = max(1, int(pw * scale)), max(1, int(ph * scale))
+    if (nw, nh) == (pw, ph):
+        return im
+    return im.resize((nw, nh), Image.LANCZOS)
+
+
+def _pick_by_role(product_imgs: list, roles) -> tuple:
+    """按 role 选出（主产品, 辅图, Logo）。
+
+    - roles 为 None/空（旧调用）：沿用原行为，第一张即主产品图
+    - role=product：第 1 张主产品、第 2 张辅图（最多两张）
+    - role=logo：第 1 张作为 Logo（最多一张）
+    - role=reference 及其他：只作参考，不叠加到本地预览成图
+    """
+    if not roles:
+        return (product_imgs[0] if product_imgs else None), None, None
+    prods, logos = [], []
+    for im, role in zip(product_imgs, roles):
+        r = str(role or "").strip().lower()
+        if r == "product":
+            prods.append(im)
+        elif r == "logo":
+            logos.append(im)
+    primary = prods[0] if prods else None
+    aux = prods[1] if len(prods) > 1 else None
+    logo = logos[0] if logos else None
+    return primary, aux, logo
+
+
 def _shadow(im: Image.Image):
     a = im.split()[3]
     sh = Image.new("RGBA", im.size, (0, 0, 0, 0))
@@ -111,11 +155,13 @@ def _shadow(im: Image.Image):
     return sh
 
 
-def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int, h: int) -> Image.Image:
+def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int, h: int,
+                roles: list | None = None) -> Image.Image:
     rnd = random.Random(seed)
     top, bottom = _scene_colors(prompt)
     canvas = _gradient(w, h, top, bottom)
-    dr = ImageDraw.Draw(canvas)
+    # 注意：后面 Image.alpha_composite(...) 会返回一张**新画布**，绘制对象必须在最终画布上重新创建，
+    # 否则所有绘制都会落在被丢弃的旧缓冲上（标题/副标题丢失的根因）。
     # 柔和径向高光
     glow = Image.new("RGBA", (w, h), (255, 255, 255, 0))
     gd = ImageDraw.Draw(glow)
@@ -123,9 +169,12 @@ def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int
     gd.ellipse([cx - w * 0.42, cy - h * 0.42, cx + w * 0.42, cy + h * 0.42], fill=(255, 255, 255, 40))
     canvas = Image.alpha_composite(canvas, glow.filter(ImageFilter.GaussianBlur(60)))
 
-    # 产品主体
-    if product_imgs:
-        prod = _fit_product(product_imgs[0], int(w * 0.62), int(h * 0.62))
+    # 按 role 选择主产品 / 辅图 / Logo（roles 缺失时第一张即主产品图，保持旧行为）
+    primary, aux, logo = _pick_by_role(product_imgs, roles)
+
+    # 产品主体：role=product 的第一张（保持原 R1 成图行为）
+    if primary is not None:
+        prod = _fit_product(primary, int(w * 0.62), int(h * 0.62))
         px = (w - prod.width) // 2
         py = int(h * 0.40) - prod.height // 2
         py = max(int(h * 0.12), py)
@@ -134,12 +183,26 @@ def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int
         canvas.alpha_composite(prod, (px, py))
     else:
         # 无产品图：绘制占位主体块（明确标注，不冒充真实产品）
+        dr = ImageDraw.Draw(canvas)
         bx, by, bw, bh = int(w * 0.22), int(h * 0.2), int(w * 0.56), int(h * 0.5)
         dr.rounded_rectangle([bx, by, bx + bw, by + bh], radius=24, fill=(255, 255, 255, 200), outline=(120, 120, 120, 255), width=3)
         f = _font(int(h * 0.04))
         dr.text((w // 2, int(h * 0.45)), "未提供产品图", font=f, fill=(90, 90, 90, 255), anchor="mm")
 
-    # 文字层（可编辑，导出时叠加）
+    # 右下辅图（role=product 第二张）：≤22%×22%，等比、不放大；底边止于 0.72h，避开标题/副标题区
+    if aux is not None:
+        a = _fit_limited(aux, int(w * LOCAL_AUX_MAX_W), int(h * LOCAL_AUX_MAX_H))
+        right = w - int(w * LOCAL_AUX_RIGHT_MARGIN)
+        bottom = int(h * LOCAL_AUX_BOTTOM)
+        canvas.alpha_composite(a, (max(0, right - a.width), max(0, bottom - a.height)))
+
+    # 左上 Logo（role=logo 第一张）：≤18%×12%，等比、不放大；不当作产品主体
+    if logo is not None:
+        g = _fit_limited(logo, int(w * LOCAL_LOGO_MAX_W), int(h * LOCAL_LOGO_MAX_H))
+        canvas.alpha_composite(g, (int(w * LOCAL_LOGO_X), int(h * LOCAL_LOGO_Y)))
+
+    # 文字层（可编辑，导出时叠加）：在最终画布上创建绘制对象，确保标题线/标题/副标题进入返回图像
+    dr = ImageDraw.Draw(canvas)
     title = (params.get("title") or "产品主图").strip()
     subtitle = (params.get("subtitle") or "").strip()
     bar_y = int(h * 0.82)
@@ -152,7 +215,7 @@ def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int
     return canvas.convert("RGB")
 
 
-def generate(req: dict, reference_images: list) -> dict:
+def generate(req: dict, reference_images: list, roles: list | None = None) -> dict:
     """req: {model_id, prompt, negative_prompt, reference_asset_ids, aspect_ratio,
              resolution_tier, count, seed, params}。返回 GenerationResult。"""
     aspect = req.get("aspect_ratio", "1:1")
@@ -164,7 +227,7 @@ def generate(req: dict, reference_images: list) -> dict:
 
     outputs = []
     for i in range(count):
-        im = compose_one(reference_images, req.get("prompt", ""), params, seed + i, w, h)
+        im = compose_one(reference_images, req.get("prompt", ""), params, seed + i, w, h, roles=roles)
         buf = io.BytesIO()
         im.save(buf, format="PNG")
         outputs.append({"bytes": buf.getvalue(), "width": w, "height": h})
@@ -221,12 +284,13 @@ def supports_task(adapter: str | None, task_type: str) -> bool:
     return task_type in ADAPTER_TASKS.get(adapter or "", [])
 
 
-def dispatch(model_id: str, req: dict, reference_images: list, provider_cfg: dict | None = None, adapter: str | None = None) -> dict:
+def dispatch(model_id: str, req: dict, reference_images: list, provider_cfg: dict | None = None,
+             adapter: str | None = None, roles: list | None = None) -> dict:
     task_type = req.get("task_type", "text_to_image")
     if model_id in ("local-poster-compositor", "demo-poster-compositor"):
         if task_type not in ("text_to_image", "image_to_image", "product_composition"):
             raise ValueError(f"演示拼接器不支持任务类型 {task_type}")
-        return generate(req, reference_images)
+        return generate(req, reference_images, roles=roles)
     if adapter and not supports_task(adapter, task_type):
         raise ValueError(f"模型 {model_id} 不支持任务类型 {task_type}；该适配器当前支持：{ADAPTER_TASKS.get(adapter, [])}")
     if adapter == "image_openai" and provider_cfg:

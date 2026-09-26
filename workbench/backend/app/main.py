@@ -1164,6 +1164,14 @@ NODE_DEFAULTS = {
     "layout_export": {"title": "", "subtitle": "", "approved": False},
 }
 
+# image_prompt 运行时的字段白名单：
+# - IMAGE_PROMPT_INPUT_FIELDS：输入侧配置，运行前内容里存在才保留（不凭空新增字段）
+# - IMAGE_PROMPT_OUTPUT_FIELDS：本次生成输出，生成结果优先；旧 prompt / 旧生成结果不得覆盖
+IMAGE_PROMPT_INPUT_FIELDS = ("strategy_ref", "prompt_template_id")
+IMAGE_PROMPT_OUTPUT_FIELDS = ("prompt", "negative_prompt", "requested_aspect_ratio", "selling_point_id",
+                              "product_id", "locked_visual_features", "bg_style",
+                              "prompt_template_id", "prompt_template_name")
+
 
 class NodeAdd(BaseModel):
     type: str
@@ -1324,6 +1332,32 @@ def _run_node_thread(run_id, node_id, model_id, params, ref_asset_ids, idem):
             pass
 
 
+def _persist_run_input_snapshot(run_id, snapshot, prompt_ref=None, image_ref=None, refs=None):
+    """持久化本次 image_generation 的输入快照（不新增表/字段）。
+
+    - run_inputs：上游引用行 —— 提示词节点一行（记录其版本），每个参考资产一行（按实际传入顺序）
+    - node_runs.parameters_json：在原有请求参数上附加 input_snapshot 快照键（不覆盖原有键）
+    只写白名单字段，不含任何 API Key / Cookie / 服务商凭据。
+    """
+    if not run_id:
+        return
+    prompt_ref = prompt_ref or {}
+    image_ref = image_ref or {}
+    if prompt_ref.get("node_id"):
+        db.execute("INSERT INTO run_inputs(run_id,upstream_node_id,upstream_version,asset_id) VALUES(?,?,?,?)",
+                   (run_id, prompt_ref["node_id"], prompt_ref.get("version"), None))
+    for aid in (refs or []):
+        db.execute("INSERT INTO run_inputs(run_id,upstream_node_id,upstream_version,asset_id) VALUES(?,?,?,?)",
+                   (run_id, image_ref.get("node_id"), image_ref.get("version"), aid))
+    row = db.query_one("SELECT parameters_json FROM node_runs WHERE id=?", (run_id,)) or {}
+    params = json_loads(row.get("parameters_json"), {}) or {}
+    if not isinstance(params, dict):
+        params = {}
+    params["input_snapshot"] = snapshot
+    db.execute("UPDATE node_runs SET parameters_json=? WHERE id=?",
+               (json.dumps(params, ensure_ascii=False), run_id))
+
+
 def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version, run_id=None):
     """同步执行节点，返回 {outputs:[{asset_id,object_key,width,height}], usage, provider_task_id}。"""
     if ntype == "strategy":
@@ -1344,6 +1378,8 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
         strat = get_upstream_strategy(node_id)
         baseline = (strat or {}).get("visual_baseline", {})
         cur_ver = get_current_version(node_id) or {}
+        # 运行前快照输入侧配置：生成结果不得覆盖这些用户配置
+        input_config = {k: cur_ver[k] for k in IMAGE_PROMPT_INPUT_FIELDS if k in cur_ver}
         sref = cur_ver.get("strategy_ref", "hero_1")
         item = next((s for s in strat.get("strategies", []) if s["id"] == sref), strat.get("strategies", [{}])[0] if strat.get("strategies") else {})
         prov = registry.resolve_provider(model_id or "rule-based-planner")
@@ -1371,7 +1407,11 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
                       "prompt_template_id": tpl["id"],
                       "prompt_template_name": tpl["name"]}
             used_tpl_id = tpl["id"]
-        set_node_version(node_id, prompt, author_type="ai", model_id=model_id or "rule-based-planner")
+        # 生成成功：按字段白名单组装新 content —— 输入配置在前，本次生成输出在后（生成输出优先，
+        # 旧 prompt 与旧生成结果不会被合并回来）
+        generated = {k: prompt[k] for k in IMAGE_PROMPT_OUTPUT_FIELDS if k in prompt}
+        set_node_version(node_id, {**input_config, **generated},
+                         author_type="ai", model_id=model_id or "rule-based-planner")
         return {"outputs": [], "usage": {"model": model_id or "rule-based-planner",
                                          "prompt_template_id": used_tpl_id}, "provider_task_id": "prompt"}
     if ntype == "image_generation":
@@ -1394,17 +1434,48 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
         for rid in ref_asset_ids:
             if rid and db.query_one("SELECT id FROM assets WHERE id=? AND project_id=?", (rid, pid)):
                 refs.append(rid)
+        # —— 本次运行的输入快照（白名单字段）——
+        # 在调用模型前落库，成功与失败都可追溯；取值与下面构造 req 时完全一致
+        prompt_ver = (db.query_one("SELECT current_version FROM nodes WHERE id=?", (prompt_node,)) or {}).get("current_version") if prompt_node else None
+        img_ver = (db.query_one("SELECT current_version FROM nodes WHERE id=?", (img_node,)) or {}).get("current_version") if img_node else None
+        _node_row = db.query_one("SELECT graph_id FROM nodes WHERE id=?", (node_id,)) or {}
+        input_snapshot = {
+            "project_id": pid,
+            "graph_id": _node_row.get("graph_id"),
+            "node_id": node_id,
+            "run_id": run_id,
+            "model_id": model_id,
+            # 本分支未设置 req["task_type"]，与 image_gen.dispatch 的默认值保持一致
+            "task_type": "text_to_image",
+            "prompt": prompt_text,
+            "negative_prompt": neg,
+            "prompt_node_id": prompt_node,
+            "prompt_node_version": prompt_ver,
+            "reference_asset_ids": list(refs),
+            "aspect_ratio": ar,
+            "count": params.get("count", 1),
+            "resolution_tier": params.get("resolution_tier", "standard"),
+            "seed": params.get("seed"),
+            "params": {"title": params.get("title", ""), "subtitle": params.get("subtitle", "")},
+        }
+        _persist_run_input_snapshot(run_id, input_snapshot,
+                                    prompt_ref={"node_id": prompt_node, "version": prompt_ver},
+                                    image_ref={"node_id": img_node, "version": img_ver},
+                                    refs=refs)
         # 校验模型能力
         errs = registry.validate_image_params(model_id, {"aspect_ratio": ar, "count": params.get("count", 1),
                                                           "reference_count": len(refs)})
         if errs:
             raise HTTPException(422, "；".join(errs))
-        pil_imgs = []
+        pil_imgs, image_roles = [], []
         for rid in refs:
+            # role 一律从 assets 表读取（不信任客户端传入），并与实际加载成功的图片一一对应
+            row = db.query_one("SELECT object_key, role FROM assets WHERE id=?", (rid,))
             try:
-                pil_imgs.append(storage.read_pillow(db.query_one("SELECT object_key FROM assets WHERE id=?", (rid,))["object_key"]))
+                pil_imgs.append(storage.read_pillow(row["object_key"]))
             except Exception:
-                pass
+                continue
+            image_roles.append((row or {}).get("role") or "")
         req = {"model_id": model_id, "prompt": prompt_text, "negative_prompt": neg,
                "reference_asset_ids": refs, "aspect_ratio": ar,
                "resolution_tier": params.get("resolution_tier", "standard"),
@@ -1412,7 +1483,9 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
                "params": {"title": params.get("title", ""), "subtitle": params.get("subtitle", "") }}
         prov_cfg = registry.resolve_provider(model_id)
         adapter = (registry.get_model(model_id) or {}).get("adapter")
-        res = image_gen.dispatch(model_id, req, pil_imgs, provider_cfg=prov_cfg, adapter=adapter)
+        # 本地拼接器才接收 role（内部版式参数）；外部模型的请求体 req 与 payload 完全不变
+        local_roles = image_roles if model_id in ("local-poster-compositor", "demo-poster-compositor") else None
+        res = image_gen.dispatch(model_id, req, pil_imgs, provider_cfg=prov_cfg, adapter=adapter, roles=local_roles)
         outputs = []
         for o in res["outputs"]:
             aid = db.gen_id("ast")
@@ -1494,37 +1567,61 @@ def get_upstream_strategy(node_id):
     return get_current_version(sid) if sid else {}
 
 
-@app.post("/api/nodes/{nid}/runs")
-def run_node(nid: str, body: RunReq, request: Request):
-    authz.require_node_permission(auth.require_actor(request), nid, "generation.run")
+def _resolve_run_model(nid: str, ntype: str, model_id):
+    """模型回退链：显式指定 -> 项目默认 -> 内置默认。
+
+    按节点类型区分文本/图片模型，避免把图片模型传给文本节点。
+    """
+    if model_id:
+        return model_id
+    proj = get_project_of_node(nid)
+    dflt = db.query_one("SELECT default_text_model, default_image_model FROM projects WHERE id=?", (proj,))
+    if ntype == "image_generation":
+        return (dflt["default_image_model"] if dflt and dflt["default_image_model"] else None) or "local-poster-compositor"
+    return (dflt["default_text_model"] if dflt and dflt["default_text_model"] else None) or "rule-based-planner"
+
+
+def _create_node_run(nid: str, model_id, params: dict, ref_asset_ids=None, idempotency_key=None,
+                     node_version: int = 0, actor=None) -> dict:
+    """创建一次节点运行并启动执行线程（HTTP 路由与「重跑下游」共用同一套逻辑）。
+
+    actor 必须是调用方已经通过鉴权的身份：本函数不自行放行，缺少 actor 直接拒绝。
+    运行记录、执行线程、版本写入与 stale 传播全部沿用既有路径。
+    """
+    if actor is None:
+        raise HTTPException(500, "内部错误：缺少已认证身份")
+    params = params or {}
     n = db.query_one("SELECT type FROM nodes WHERE id=?", (nid,))
     if not n:
         raise HTTPException(404, "节点不存在")
     # 幂等：相同 idempotency_key 已成功则直接返回
-    if body.idempotency_key:
-        ex = db.query_one("SELECT * FROM node_runs WHERE idempotency_key=? AND status='succeeded' LIMIT 1", (body.idempotency_key,))
+    if idempotency_key:
+        ex = db.query_one("SELECT * FROM node_runs WHERE idempotency_key=? AND status='succeeded' LIMIT 1", (idempotency_key,))
         if ex:
             return {"run_id": ex["id"], "idempotent": True}
-    # 模型回退链：显式指定 -> 项目默认 -> 内置默认
-    model_id = body.model_id
-    if not model_id:
-        proj = get_project_of_node(nid)
-        dflt = db.query_one("SELECT default_text_model, default_image_model FROM projects WHERE id=?", (proj,))
-        if n["type"] == "image_generation":
-            model_id = (dflt["default_image_model"] if dflt and dflt["default_image_model"] else None) or "local-poster-compositor"
-        else:
-            model_id = (dflt["default_text_model"] if dflt and dflt["default_text_model"] else None) or "rule-based-planner"
+    model_id = _resolve_run_model(nid, n["type"], model_id)
     gid = db.query_one("SELECT graph_id FROM nodes WHERE id=?", (nid,))["graph_id"]
     gv = db.query_one("SELECT current_version FROM graphs WHERE id=?", (gid,))["current_version"]
     run_id = db.gen_id("run")
     db.execute("INSERT INTO node_runs(id,node_id,node_version,graph_version,status,model_id,parameters_json,idempotency_key,started_at) "
                "VALUES(?,?,?,?,?,?,?,?,?)",
-               (run_id, nid, body.node_version or 0, gv, "queued", model_id, json.dumps(body.params),
-                body.idempotency_key, db.now()))
-    t = threading.Thread(target=_run_node_thread, args=(run_id, nid, model_id, body.params, body.reference_asset_ids, body.idempotency_key))
+               (run_id, nid, node_version or 0, gv, "queued", model_id, json.dumps(params),
+                idempotency_key, db.now()))
+    t = threading.Thread(target=_run_node_thread,
+                         args=(run_id, nid, model_id, params, ref_asset_ids or [], idempotency_key))
     t.daemon = True
     t.start()
-    return {"run_id": run_id}
+    return {"run_id": run_id, "model_id": model_id}
+
+
+@app.post("/api/nodes/{nid}/runs")
+def run_node(nid: str, body: RunReq, request: Request):
+    actor = authz.require_node_permission(auth.require_actor(request), nid, "generation.run")
+    created = _create_node_run(nid, body.model_id, body.params, body.reference_asset_ids,
+                               body.idempotency_key, node_version=body.node_version or 0, actor=actor)
+    if created.pop("idempotent", False):
+        return {"run_id": created["run_id"], "idempotent": True}
+    return {"run_id": created["run_id"]}
 
 
 @app.get("/api/runs/{rid}")
@@ -1533,7 +1630,9 @@ def get_run(rid: str, request: Request):
     if not r:
         raise HTTPException(404, "运行不存在")
     outs = db.query("SELECT asset_id, output_json FROM run_outputs WHERE run_id=?", (rid,))
-    return {**dict(r), "outputs": outs}
+    params = json_loads(r.get("parameters_json"), {}) or {}
+    snapshot = params.get("input_snapshot") if isinstance(params, dict) else None
+    return {**dict(r), "outputs": outs, "input_snapshot": snapshot}
 
 
 @app.get("/api/runs/{rid}/events")
@@ -1562,20 +1661,126 @@ def run_events(rid: str, request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+# 「重跑下游」可自动执行的节点类型；其余类型（产品事实/参考图/审核/排版导出）为人工或输入节点，
+# 会显式列入 skipped 并给出原因，不静默跳过。
+RUN_DOWNSTREAM_TYPES = ("strategy", "image_prompt", "image_generation")
+RUN_DOWNSTREAM_TIMEOUT = float(os.environ.get("WB_RUN_DOWNSTREAM_TIMEOUT", "180"))
+
+
+def topological_downstream(graph_id: str, from_node_id: str) -> list:
+    """从起点可达的下游节点拓扑序（不含起点自身）；发现环时报错。"""
+    node_ids = [n["id"] for n in db.query("SELECT id FROM nodes WHERE graph_id=?", (graph_id,))]
+    children = defaultdict(list)
+    for e in db.query("SELECT from_node, to_node FROM edges WHERE graph_id=?", (graph_id,)):
+        if e["from_node"] in node_ids and e["to_node"] in node_ids:
+            children[e["from_node"]].append(e["to_node"])
+    # 可达子图（只跟出边，起点自身不计入）
+    reachable, seen, frontier = [], {from_node_id}, [from_node_id]
+    while frontier:
+        cur = frontier.pop()
+        for child in children.get(cur, []):
+            if child not in seen:
+                seen.add(child)
+                reachable.append(child)
+                frontier.append(child)
+    # Kahn 拓扑排序（入度只统计可达子图内部）
+    indeg = {nid: 0 for nid in reachable}
+    for nid in reachable:
+        for child in children.get(nid, []):
+            if child in indeg:
+                indeg[child] += 1
+    queue = deque([nid for nid in reachable if indeg[nid] == 0])
+    order = []
+    while queue:
+        nid = queue.popleft()
+        order.append(nid)
+        for child in children.get(nid, []):
+            if child in indeg:
+                indeg[child] -= 1
+                if indeg[child] == 0:
+                    queue.append(child)
+    if len(order) != len(reachable):
+        raise HTTPException(409, "工作流存在环，无法按依赖顺序重跑下游")
+    return order
+
+
+def _downstream_require_inputs(nid: str, ntype: str) -> None:
+    """执行前校验必要上游输入；缺失时给出明确错误，不静默跳过。"""
+    if ntype == "image_prompt":
+        strat_id = upstream_of_type(nid, "strategy")
+        strat = get_current_version(strat_id) if strat_id else {}
+        if not (strat or {}).get("strategies"):
+            raise HTTPException(422, f"提示词节点 {nid} 缺少上游策略内容（策略为空或策略节点未执行）")
+    elif ntype == "image_generation":
+        pnode = upstream_of_type(nid, "image_prompt")
+        pc = get_current_version(pnode) if pnode else {}
+        if not str(pc.get("prompt") or "").strip():
+            raise HTTPException(422, f"生图节点 {nid} 缺少上游提示词（提示词为空或提示词节点未执行）")
+
+
+def _wait_node_run(run_id: str, timeout: float) -> dict:
+    """等待一次运行结束（成功/失败/取消），返回最终 node_runs 行。"""
+    deadline = time.time() + timeout
+    row = {}
+    while time.time() < deadline:
+        row = db.query_one("SELECT status, error_code FROM node_runs WHERE id=?", (run_id,)) or {}
+        if row.get("status") in ("succeeded", "failed", "canceled"):
+            return row
+        time.sleep(0.2)
+    return row
+
+
 @app.post("/api/graphs/{gid}/run-downstream")
 def run_downstream(gid: str, body: dict, request: Request):
-    authz.require_graph_permission(auth.require_actor(request), gid, "generation.run")
-    from_node = body.get("from_node_id")
-    if not from_node or not db.query_one("SELECT id FROM nodes WHERE id=?", (from_node,)):
-        raise HTTPException(404, "起始节点不存在")
-    ds = downstream_node_ids(from_node)
-    ran = []
-    for d in ds:
-        t = db.query_one("SELECT type FROM nodes WHERE id=?", (d,))["type"]
-        if t == "image_generation":
-            r = run_node(d, RunReq(model_id="local-poster-compositor", params={}))
-            ran.append(r["run_id"])
-    return {"ran": ran}
+    """按 DAG 依赖顺序重跑从起点可达的下游节点（策略 → 提示词 → 生图）。
+
+    - 只执行从起点可达、类型受支持的节点；未连接的分支不会被执行
+    - 每个节点等待其运行结束后才继续，失败立即停止后续依赖执行
+    - 返回：order（拓扑序）、ran（已完成）、skipped（不自动执行）、failed、not_executed
+    """
+    actor = authz.require_graph_permission(auth.require_actor(request), gid, "generation.run")
+    from_node = (body or {}).get("from_node_id")
+    start = db.query_one("SELECT id,type FROM nodes WHERE id=? AND graph_id=?", (from_node, gid))
+    if not start:
+        raise HTTPException(404, "起始节点不存在或不属于该图")
+
+    order = topological_downstream(gid, from_node)
+    ran, skipped = [], []
+    failed = None
+    not_executed = []
+
+    def _type_of(node_id):
+        return (db.query_one("SELECT type FROM nodes WHERE id=?", (node_id,)) or {}).get("type")
+
+    for idx, nid in enumerate(order):
+        ntype = _type_of(nid)
+        if ntype not in RUN_DOWNSTREAM_TYPES:
+            skipped.append({"node_id": nid, "type": ntype, "reason": "该类型不由「重跑下游」自动执行"})
+            continue
+        try:
+            _downstream_require_inputs(nid, ntype)
+            v_before = (db.query_one("SELECT current_version FROM nodes WHERE id=?", (nid,)) or {}).get("current_version")
+            created = _create_node_run(nid, None, {}, [], None, actor=actor)
+            run_id = created["run_id"]
+            result = _wait_node_run(run_id, RUN_DOWNSTREAM_TIMEOUT)
+            v_after = (db.query_one("SELECT current_version FROM nodes WHERE id=?", (nid,)) or {}).get("current_version")
+            entry = {"node_id": nid, "type": ntype, "run_id": run_id, "model_id": created.get("model_id"),
+                     "status": result.get("status"), "version_before": v_before, "version_after": v_after}
+            if result.get("status") != "succeeded":
+                entry["error"] = result.get("error_code") or "运行未在超时时间内结束"
+                failed = entry
+                not_executed = [{"node_id": x, "type": _type_of(x)} for x in order[idx + 1:]]
+                break
+            ran.append(entry)
+        except HTTPException as e:
+            failed = {"node_id": nid, "type": ntype, "status": "rejected",
+                      "error": str(e.detail), "status_code": e.status_code}
+            not_executed = [{"node_id": x, "type": _type_of(x)} for x in order[idx + 1:]]
+            break
+
+    return {"graph_id": gid, "from_node_id": from_node, "order": order,
+            "ran": ran, "skipped": skipped, "failed": failed, "not_executed": not_executed,
+            "status": "failed" if failed else "ok"}
 
 
 # ---------------- models ----------------
