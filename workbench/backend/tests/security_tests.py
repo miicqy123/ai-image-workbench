@@ -52,9 +52,14 @@ class Client:
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
 
     def req(self, method: str, path: str, body=None, headers=None):
-        h = {"Content-Type": "application/json"}
+        # 默认带 Origin：模拟浏览器同源请求，满足第 2 批的 CSRF 同源校验
+        h = {"Content-Type": "application/json", "Origin": self.base}
         if headers:
-            h.update(headers)
+            for k, v in headers.items():
+                if v is None:
+                    h.pop(k, None)
+                else:
+                    h[k] = v
         data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
         r = urllib.request.Request(self.base + path, data=data, method=method, headers=h)
         try:

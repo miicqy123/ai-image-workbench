@@ -78,7 +78,7 @@ export default function Root() {
         <button className="btn ghost" onClick={doLogout}>退出</button>
       </div>
       <div className="app-body">
-        {area === 'admin' && canAdmin ? <Admin onBack={() => setArea(canCreator ? 'creator' : 'admin')} /> : creatorView}
+        {area === 'admin' && canAdmin ? <Admin onBack={() => setArea(canCreator ? 'creator' : 'admin')} permissions={me?.permissions || []} /> : creatorView}
       </div>
     </div>
   )

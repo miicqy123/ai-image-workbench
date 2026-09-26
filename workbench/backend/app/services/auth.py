@@ -22,6 +22,9 @@ SESSION_COOKIE = "wb_session"
 SESSION_TTL_SECONDS = int(os.environ.get("WB_SESSION_TTL", str(12 * 3600)))
 PBKDF2_ITERATIONS = int(os.environ.get("WB_PBKDF2_ITERATIONS", "200000"))
 COOKIE_SECURE = os.environ.get("WB_COOKIE_SECURE", "0").lower() in ("1", "true", "yes")
+COOKIE_SAMESITE = (os.environ.get("WB_COOKIE_SAMESITE", "lax").strip().lower() or "lax")
+if COOKIE_SAMESITE not in ("lax", "strict", "none"):
+    COOKIE_SAMESITE = "lax"
 
 WB_ENV = (os.environ.get("WB_ENV") or "development").strip().lower()
 DEV_AUTH_REQUESTED = os.environ.get("WB_DEV_AUTH", "0").strip().lower() in ("1", "true", "yes")
@@ -41,6 +44,7 @@ class Actor:
     organization_id: str | None = None
     workspace_id: str | None = None
     permissions: list = field(default_factory=list)
+    org_ids: list = field(default_factory=list)
     session_id: str | None = None
     dev_mode: bool = False
 
@@ -153,6 +157,13 @@ def _build_actor(user_id: str, session: dict | None = None, requested_workspace:
         chosen = chosen or (ms[0] if ms else None)
     role_source = (chosen or {}).get("role") or u.get("role")
     role = rbac.resolve_role(role_source)
+    org_ids = []
+    for m in ms:
+        oid = m.get("organization_id")
+        if oid and oid not in org_ids:
+            org_ids.append(oid)
+    if not org_ids and u.get("organization_id"):
+        org_ids.append(u["organization_id"])
     return Actor(
         user_id=u["id"],
         name=u.get("name") or u["id"],
@@ -160,6 +171,7 @@ def _build_actor(user_id: str, session: dict | None = None, requested_workspace:
         organization_id=(chosen or {}).get("organization_id") or u.get("organization_id"),
         workspace_id=(chosen or {}).get("workspace_id"),
         permissions=rbac.permissions_for(role),
+        org_ids=org_ids,
         session_id=(session or {}).get("id"),
         dev_mode=dev_mode,
     )
@@ -207,7 +219,7 @@ def service_actor(request: Request, admin: bool = True) -> Actor:
     role = "super_admin" if admin else "viewer"
     return Actor(user_id=SERVICE_USER_ID, name="服务凭据", role=role,
                  organization_id=None, workspace_id=None,
-                 permissions=rbac.permissions_for(role), session_id=None, dev_mode=False)
+                 permissions=rbac.permissions_for(role), org_ids=[], session_id=None, dev_mode=False)
 
 
 def login(user_id: str, password: str, request: Request | None = None) -> str | None:
@@ -238,5 +250,8 @@ def me(actor: Actor) -> dict:
         "memberships": ms,
         "active_workspace_id": actor.workspace_id,
         "permissions": actor.permissions,
+        "scope": rbac.role_scope(actor.role),
+        "organizations": [{"id": oid, "name": (db.query_one("SELECT name FROM organizations WHERE id=?", (oid,)) or {}).get("name")}
+                          for oid in (actor.org_ids or [])],
         "dev_mode": actor.dev_mode,
     }

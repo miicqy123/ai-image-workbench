@@ -187,6 +187,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     revoked_at INTEGER, ip TEXT, user_agent TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS migrations (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, started_at INTEGER, finished_at INTEGER,
+    scanned INTEGER DEFAULT 0, resolved INTEGER DEFAULT 0, unresolved INTEGER DEFAULT 0,
+    report_path TEXT, detail_json TEXT
+);
 """
 
 

@@ -136,6 +136,9 @@ export const api = {
   readNotification: (nid: string) => fetch(`${BASE}/api/creator/notifications/${nid}/read`, { method: 'POST' }).then(j<any>),
   readAllNotifications: () => fetch(`${BASE}/api/creator/notifications/read-all`, { method: 'POST' }).then(j<any>),
   adminRoles: () => fetch(`${BASE}/api/admin/roles`).then(j<any>),
+  adminUnassignedProjects: () => fetch(`${BASE}/api/admin/projects/unassigned`).then(j<any>),
+  assignProjectOrg: (pid: string, organization_id: string, reason = '') =>
+    fetch(`${BASE}/api/admin/projects/${pid}/organization`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ organization_id, reason }) }).then(j<any>),
   adminUsers: () => fetch(`${BASE}/api/admin/users`).then(j<any[]>),
   adminUserUsage: (uid: string) => fetch(`${BASE}/api/admin/users/${uid}/usage`).then(j<any>),
   adminWorkspaces: () => fetch(`${BASE}/api/admin/workspaces`).then(j<any[]>),

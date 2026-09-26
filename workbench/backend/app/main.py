@@ -6,6 +6,7 @@
 import io
 import json
 import os
+import re
 import urllib.request
 import threading
 import time
@@ -30,6 +31,7 @@ from .services import compliance
 from .services import notify as notify_svc
 from .services import rbac
 from .services import auth
+from .services import authz
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -104,6 +106,55 @@ except ValueError:
 _RATE_WINDOW = 60.0
 _rate_hits = defaultdict(deque)
 _rate_lock = threading.Lock()
+
+
+# ---------------- CSRF 防护：同源校验 ----------------
+# 说明：
+# - 只有"环境凭据"（Cookie 会话）才会被 CSRF 利用；Bearer/机器凭据不属于环境凭据。
+# - 判断顺序：Origin → Referer → 都没有时，带会话的修改请求一律拒绝。
+# - 反向代理场景：仅当显式设置 WB_TRUST_PROXY=1 时才采信 X-Forwarded-Host / X-Forwarded-Proto，
+#   否则一律用真实 Host，避免伪造转发头绕过校验。
+# - WB_CSRF_ALLOW_NO_ORIGIN=1 仅供本地脚本调试，生产不要开启。
+_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_TRUST_PROXY = os.environ.get("WB_TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes")
+_CSRF_ALLOW_NO_ORIGIN = os.environ.get("WB_CSRF_ALLOW_NO_ORIGIN", "0").strip().lower() in ("1", "true", "yes")
+TRUSTED_ORIGINS = {o.strip().lower().rstrip("/") for o in os.environ.get("WB_TRUSTED_ORIGINS", "").split(",") if o.strip()}
+
+
+def _origin_only(value: str | None) -> str:
+    if not value:
+        return ""
+    m = re.match(r"^(https?://[^/]+)", value.strip(), re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
+
+def _expected_origin(request) -> str:
+    if _TRUST_PROXY:
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    else:
+        host = request.headers.get("host") or ""
+        proto = request.url.scheme
+    return f"{proto}://{host}".lower() if host else ""
+
+
+@app.middleware("http")
+async def csrf_middleware(request, call_next):
+    path = request.url.path
+    if request.method in _CSRF_SAFE_METHODS or not _protected(path) or _is_public(path):
+        return await call_next(request)
+    if _CSRF_ALLOW_NO_ORIGIN:
+        return await call_next(request)
+    origin = _origin_only(request.headers.get("origin")) or _origin_only(request.headers.get("referer"))
+    expected = _expected_origin(request)
+    if origin:
+        if origin == expected or origin in TRUSTED_ORIGINS:
+            return await call_next(request)
+        return JSONResponse({"detail": "跨站请求被拒绝（CSRF 同源校验未通过）"}, status_code=403)
+    # 无 Origin/Referer：只有非 Cookie 凭据（Bearer / 匿名）才放行
+    if request.cookies.get(auth.SESSION_COOKIE):
+        return JSONResponse({"detail": "缺少 Origin/Referer 的会话修改请求已被拒绝（CSRF 防护）"}, status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -211,7 +262,7 @@ class PasswordChangeIn(BaseModel):
 
 def _set_session_cookie(resp: JSONResponse, token: str) -> None:
     resp.set_cookie(auth.SESSION_COOKIE, token, max_age=auth.SESSION_TTL_SECONDS, httponly=True,
-                    samesite="lax", secure=auth.COOKIE_SECURE, path="/")
+                    samesite=auth.COOKIE_SAMESITE, secure=auth.COOKIE_SECURE, path="/")
 
 
 @app.get("/api/auth/bootstrap-state")
@@ -298,24 +349,25 @@ def create_project(body: ProjectCreate, request: Request):
 
 
 @app.get("/api/projects")
-def list_projects():
-    return db.query("SELECT id,name,status,created_at FROM projects ORDER BY created_at DESC")
+def list_projects(request: Request):
+    actor = auth.require_actor(request)
+    clause, args = authz.org_scope_clause(actor, "organization_id")
+    return db.query("SELECT id,name,status,created_at,organization_id FROM projects WHERE 1=1" + clause
+                    + " ORDER BY created_at DESC", tuple(args))
 
 
 @app.get("/api/projects/{pid}")
-def get_project(pid):
-    p = db.query_one("SELECT * FROM projects WHERE id=?", (pid,))
-    if not p:
-        raise HTTPException(404, "项目不存在")
+def get_project(pid: str, request: Request):
+    actor = auth.require_actor(request)
+    p = authz.require_project_permission(actor, pid, "project.read")
     p = dict(p)
     p["graph"] = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     return p
 
 
 @app.delete("/api/projects/{pid}")
-def delete_project(pid):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def delete_project(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.delete")
     asset_ids = [a["id"] for a in db.query("SELECT id FROM assets WHERE project_id=?", (pid,))]
     db.execute("DELETE FROM canvas_layers WHERE project_id=?", (pid,))
     db.execute("DELETE FROM agent_plans WHERE project_id=?", (pid,))
@@ -350,9 +402,8 @@ class ProjectRename(BaseModel):
 
 
 @app.patch("/api/projects/{pid}")
-def rename_project(pid: str, body: ProjectRename):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def rename_project(pid: str, body: ProjectRename, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(422, "项目名不能为空")
@@ -361,10 +412,9 @@ def rename_project(pid: str, body: ProjectRename):
 
 
 @app.get("/api/projects/{pid}/defaults")
-def get_defaults(pid: str):
+def get_defaults(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.read")
     p = db.query_one("SELECT default_text_model, default_image_model FROM projects WHERE id=?", (pid,))
-    if not p:
-        raise HTTPException(404, "项目不存在")
     return {"default_text_model": p["default_text_model"] or "", "default_image_model": p["default_image_model"] or ""}
 
 
@@ -374,10 +424,9 @@ class DefaultsUpdate(BaseModel):
 
 
 @app.put("/api/projects/{pid}/defaults")
-def put_defaults(pid: str, body: DefaultsUpdate):
+def put_defaults(pid: str, body: DefaultsUpdate, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
     p = db.query_one("SELECT id FROM projects WHERE id=?", (pid,))
-    if not p:
-        raise HTTPException(404, "项目不存在")
     fields = {}
     if body.default_text_model is not None:
         if body.default_text_model:
@@ -440,7 +489,8 @@ BRIEF_COLS = ("id,project_id,user_prompt,purpose,platform,aspect_ratio,image_cou
 
 
 @app.get("/api/projects/{pid}/brief")
-def get_brief(pid: str):
+def get_brief(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.read")
     r = db.query_one("SELECT * FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
     if not r:
         raise HTTPException(404, "brief 不存在")
@@ -448,9 +498,10 @@ def get_brief(pid: str):
 
 
 @app.post("/api/projects/{pid}/brief", status_code=201)
-def create_brief(pid: str, body: BriefIn):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def create_brief(pid: str, body: BriefIn, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
+    authz.assert_assets_in_project(pid, list(body.product_asset_ids or []) + list(body.reference_asset_ids or []),
+                                   field="generation_brief")
     bid = db.gen_id("brief"); now = int(db.now())
     db.execute("INSERT INTO generation_briefs(" + BRIEF_COLS + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (bid, pid) + _brief_vals(body) + (now, now))
@@ -458,9 +509,10 @@ def create_brief(pid: str, body: BriefIn):
 
 
 @app.put("/api/projects/{pid}/brief")
-def upsert_brief(pid: str, body: BriefIn):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def upsert_brief(pid: str, body: BriefIn, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
+    authz.assert_assets_in_project(pid, list(body.product_asset_ids or []) + list(body.reference_asset_ids or []),
+                                   field="generation_brief")
     now = int(db.now())
     ex = db.query_one("SELECT id FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
     if ex:
@@ -640,10 +692,15 @@ def admin_delete_prompt_template(pid: str):
 
 # ---------------- 前台工作台 ----------------
 @app.get("/api/creator/dashboard")
-def creator_dashboard():
-    projects = db.query("SELECT id,name,status,created_at FROM projects ORDER BY created_at DESC")
-    jobs = db.query("SELECT project_id,status FROM generation_jobs")
-    briefs = {b["project_id"] for b in db.query("SELECT DISTINCT project_id FROM generation_briefs")}
+def creator_dashboard(request: Request):
+    actor = auth.require_actor(request)
+    clause, args = authz.org_scope_clause(actor, "organization_id")
+    projects = db.query("SELECT id,name,status,created_at,organization_id FROM projects WHERE 1=1" + clause
+                        + " ORDER BY created_at DESC", tuple(args))
+    visible = {p["id"] for p in projects}
+    jobs = [j for j in db.query("SELECT project_id,status FROM generation_jobs") if j["project_id"] in visible]
+    briefs = {b["project_id"] for b in db.query("SELECT DISTINCT project_id FROM generation_briefs")
+              if b["project_id"] in visible}
     out = []
     for p in projects:
         pj = [j for j in jobs if j["project_id"] == p["id"]]
@@ -663,22 +720,23 @@ def creator_dashboard():
 
 
 @app.post("/api/projects/{pid}/archive")
-def archive_project(pid: str):
+def archive_project(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
     db.execute("UPDATE projects SET status='archived', updated_at=? WHERE id=?", (db.now(), pid))
     return {"ok": True}
 
 
 @app.post("/api/projects/{pid}/restore")
-def restore_project(pid: str):
+def restore_project(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
     db.execute("UPDATE projects SET status='active', updated_at=? WHERE id=?", (db.now(), pid))
     return {"ok": True}
 
 
 @app.post("/api/projects/{pid}/duplicate", status_code=201)
-def duplicate_project(pid: str):
-    src = db.query_one("SELECT * FROM projects WHERE id=?", (pid,))
-    if not src:
-        raise HTTPException(404, "项目不存在")
+def duplicate_project(pid: str, request: Request):
+    actor = auth.require_actor(request)
+    src = authz.require_project_permission(actor, pid, "project.create")
     npid = db.gen_id("prj")
     db.execute("INSERT INTO projects(id,tenant_id,owner_id,name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                (npid, src["tenant_id"], src["owner_id"], src["name"] + " 副本", "active", db.now(), db.now()))
@@ -701,8 +759,14 @@ class JobIn(BaseModel):
 
 
 @app.post("/api/projects/{pid}/generation-jobs", status_code=201)
-def create_generation_job(pid: str, body: JobIn):
+def create_generation_job(pid: str, body: JobIn, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "generation.run")
     brief = db.query_one("SELECT * FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    if brief:
+        authz.assert_assets_in_project(
+            pid,
+            json_loads(brief["product_asset_ids_json"], []) + json_loads(brief["reference_asset_ids_json"], []),
+            field="generation_brief")
     if not brief:
         raise HTTPException(422, "请先保存 GenerationBrief")
     pv_no = (db.query_one("SELECT count(*) c FROM prompt_versions WHERE project_id=?", (pid,)) or {"c": 0})["c"] + 1
@@ -736,29 +800,26 @@ def create_generation_job(pid: str, body: JobIn):
 
 
 @app.get("/api/generation-jobs/{jid}")
-def get_generation_job(jid: str):
-    r = db.query_one("SELECT * FROM generation_jobs WHERE id=?", (jid,))
-    if not r:
-        raise HTTPException(404, "任务不存在")
-    return r
+def get_generation_job(jid: str, request: Request):
+    return authz.require_job_permission(auth.require_actor(request), jid, "job.read")
 
 
 @app.post("/api/generation-jobs/{jid}/cancel")
-def cancel_generation_job(jid: str):
+def cancel_generation_job(jid: str, request: Request):
+    authz.require_job_permission(auth.require_actor(request), jid, "generation.run")
     db.execute("UPDATE generation_jobs SET status='canceled', finished_at=? WHERE id=? AND status IN ('queued','running')", (int(db.now()), jid))
     return {"ok": True}
 
 
 @app.get("/api/projects/{pid}/candidates")
-def list_candidates(pid: str):
+def list_candidates(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "job.read")
     return db.query("SELECT * FROM generation_candidates WHERE project_id=? ORDER BY created_at DESC", (pid,))
 
 
 @app.post("/api/candidates/{cid}/select")
-def select_candidate(cid: str):
-    c = db.query_one("SELECT project_id FROM generation_candidates WHERE id=?", (cid,))
-    if not c:
-        raise HTTPException(404, "候选不存在")
+def select_candidate(cid: str, request: Request):
+    c = authz.require_candidate_permission(auth.require_actor(request), cid, "project.write")
     db.execute("UPDATE generation_candidates SET is_selected=0 WHERE project_id=?", (c["project_id"],))
     db.execute("UPDATE generation_candidates SET is_selected=1 WHERE id=?", (cid,))
     return {"ok": True}
@@ -773,7 +834,8 @@ class CanvasIn(BaseModel):
 
 
 @app.get("/api/projects/{pid}/canvas")
-def get_canvas(pid: str):
+def get_canvas(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.read")
     r = db.query_one("SELECT * FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
     if not r:
         raise HTTPException(404, "画布不存在")
@@ -782,9 +844,11 @@ def get_canvas(pid: str):
 
 
 @app.put("/api/projects/{pid}/canvas")
-def put_canvas(pid: str, body: CanvasIn):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def put_canvas(pid: str, body: CanvasIn, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
+    # 画布图层引用的素材必须属于本项目，杜绝把 B 项目图片合成进 A 项目成品
+    layer_asset_ids = [l.get("asset_id") for l in ((body.document or {}).get("layers") or []) if isinstance(l, dict)]
+    authz.assert_assets_in_project(pid, layer_asset_ids, field="canvas_layer")
     now = int(db.now())
     ex = db.query_one("SELECT id FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
     doc_json = json.dumps(body.document, ensure_ascii=False)
@@ -805,7 +869,8 @@ def put_canvas(pid: str, body: CanvasIn):
 
 
 @app.post("/api/projects/{pid}/canvas/export")
-def export_canvas(pid: str):
+def export_canvas(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.export")
     _review_gate(pid, raise_error=True)
     r = db.query_one("SELECT * FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
     if not r:
@@ -841,10 +906,9 @@ def export_canvas(pid: str):
 
 # ---------------- assets ----------------
 @app.post("/api/projects/{pid}/assets")
-def upload_asset(pid: str, file: UploadFile = File(...), role: str = Form("product"),
+def upload_asset(request: Request, pid: str, file: UploadFile = File(...), role: str = Form("product"),
                 source: str = Form("upload"), origin: str = Form("")):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+    authz.require_project_permission(auth.require_actor(request), pid, "asset.upload")
     data = file.file.read()
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "文件过大（上限 20MB）")
@@ -887,9 +951,8 @@ def _extract_text(filename: str, data: bytes) -> str:
 
 
 @app.post("/api/projects/{pid}/assets/batch")
-def upload_assets_batch(pid: str, files: list[UploadFile] = File(...), role: str = Form("product"), source: str = Form("upload")):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def upload_assets_batch(request: Request, pid: str, files: list[UploadFile] = File(...), role: str = Form("product"), source: str = Form("upload")):
+    authz.require_project_permission(auth.require_actor(request), pid, "asset.upload")
     results = []
     for f in files:
         data = f.file.read()
@@ -912,9 +975,8 @@ def upload_assets_batch(pid: str, files: list[UploadFile] = File(...), role: str
 
 
 @app.post("/api/projects/{pid}/files/import")
-def import_text_file(pid: str, file: UploadFile = File(...)):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def import_text_file(request: Request, pid: str, file: UploadFile = File(...)):
+    authz.require_project_permission(auth.require_actor(request), pid, "asset.upload")
     data = file.file.read()
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "文件过大")
@@ -923,33 +985,29 @@ def import_text_file(pid: str, file: UploadFile = File(...)):
 
 
 @app.get("/api/projects/{pid}/assets")
-def list_assets(pid: str):
+def list_assets(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "asset.read")
     return db.query("SELECT id,role,kind,mime,width,height,created_at,object_key FROM assets WHERE project_id=?", (pid,))
 
 
 @app.get("/api/assets/{aid}/download")
-def download_asset(aid: str):
-    a = db.query_one("SELECT * FROM assets WHERE id=?", (aid,))
-    if not a:
-        raise HTTPException(404, "资产不存在")
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (a["project_id"],)):
-        raise HTTPException(404, "资产所属项目不存在，禁止访问")
+def download_asset(aid: str, request: Request):
+    a = authz.require_asset_permission(auth.require_actor(request), aid, "asset.read")
     data = storage.read_bytes(a["object_key"])
     return Response(content=data, media_type=a["mime"] or "image/png")
 
 
 @app.get("/files/{asset_id}")
-def file_content(asset_id: str):
-    a = db.query_one("SELECT * FROM assets WHERE id=?", (asset_id,))
-    if not a:
-        raise HTTPException(404, "资产不存在")
+def file_content(asset_id: str, request: Request):
+    a = authz.require_asset_permission(auth.require_actor(request), asset_id, "asset.read")
     data = storage.read_bytes(a["object_key"])
     return Response(content=data, media_type=a["mime"] or "image/png")
 
 
 # ---------------- graph ----------------
 @app.get("/api/projects/{pid}/graph")
-def get_graph(pid: str):
+def get_graph(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.read")
     g = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     if not g:
         raise HTTPException(404, "图不存在")
@@ -974,7 +1032,8 @@ class GraphPatch(BaseModel):
 
 
 @app.patch("/api/projects/{pid}/graph")
-def patch_graph(pid: str, body: GraphPatch):
+def patch_graph(pid: str, body: GraphPatch, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
     g = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     if not g:
         raise HTTPException(404, "图不存在")
@@ -1041,7 +1100,8 @@ WORKFLOW_SKELETONS = {
 
 
 @app.post("/api/projects/{pid}/graph/init-template")
-def init_template(pid: str, body: InitWorkflow | None = None):
+def init_template(pid: str, request: Request, body: InitWorkflow | None = None):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
     g = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     if not g:
         raise HTTPException(404, "图不存在")
@@ -1112,7 +1172,8 @@ class NodeAdd(BaseModel):
 
 
 @app.post("/api/graphs/{gid}/nodes")
-def add_node(gid: str, body: NodeAdd):
+def add_node(gid: str, body: NodeAdd, request: Request):
+    authz.require_graph_permission(auth.require_actor(request), gid, "project.write")
     g = db.query_one("SELECT id FROM graphs WHERE id=?", (gid,))
     if not g:
         raise HTTPException(404, "图不存在")
@@ -1126,7 +1187,8 @@ def add_node(gid: str, body: NodeAdd):
 
 
 @app.delete("/api/nodes/{nid}")
-def delete_node(nid: str):
+def delete_node(nid: str, request: Request):
+    authz.require_node_permission(auth.require_actor(request), nid, "project.write")
     db.execute("DELETE FROM edges WHERE from_node=? OR to_node=?", (nid, nid))
     db.execute("DELETE FROM node_versions WHERE node_id=?", (nid,))
     db.execute("DELETE FROM node_candidates WHERE node_id=?", (nid,))
@@ -1136,7 +1198,8 @@ def delete_node(nid: str):
 
 # ---------------- nodes ----------------
 @app.get("/api/nodes/{nid}")
-def get_node(nid: str):
+def get_node(nid: str, request: Request):
+    authz.require_node_permission(auth.require_actor(request), nid, "project.read")
     n = db.query_one("SELECT * FROM nodes WHERE id=?", (nid,))
     if not n:
         raise HTTPException(404, "节点不存在")
@@ -1153,7 +1216,8 @@ class NodePatch(BaseModel):
 
 
 @app.patch("/api/nodes/{nid}")
-def patch_node(nid: str, body: NodePatch):
+def patch_node(nid: str, body: NodePatch, request: Request):
+    authz.require_node_permission(auth.require_actor(request), nid, "project.write")
     if body.content is not None:
         set_node_version(nid, body.content, author_type="human")
         mark_stale(nid)
@@ -1172,7 +1236,8 @@ class AiEdit(BaseModel):
 
 
 @app.post("/api/nodes/{nid}/ai-edit")
-def ai_edit(nid: str, body: AiEdit):
+def ai_edit(nid: str, body: AiEdit, request: Request):
+    authz.require_node_permission(auth.require_actor(request), nid, "project.write")
     n = db.query_one("SELECT type FROM nodes WHERE id=?", (nid,))
     if not n:
         raise HTTPException(404, "节点不存在")
@@ -1192,7 +1257,8 @@ class ApplyCandidate(BaseModel):
 
 
 @app.post("/api/nodes/{nid}/apply-candidate")
-def apply_candidate(nid: str, body: ApplyCandidate):
+def apply_candidate(nid: str, body: ApplyCandidate, request: Request):
+    authz.require_node_permission(auth.require_actor(request), nid, "project.write")
     c = db.query_one("SELECT * FROM node_candidates WHERE id=? AND node_id=?", (body.candidate_id, nid))
     if not c:
         raise HTTPException(404, "候选不存在")
@@ -1429,7 +1495,8 @@ def get_upstream_strategy(node_id):
 
 
 @app.post("/api/nodes/{nid}/runs")
-def run_node(nid: str, body: RunReq):
+def run_node(nid: str, body: RunReq, request: Request):
+    authz.require_node_permission(auth.require_actor(request), nid, "generation.run")
     n = db.query_one("SELECT type FROM nodes WHERE id=?", (nid,))
     if not n:
         raise HTTPException(404, "节点不存在")
@@ -1461,8 +1528,8 @@ def run_node(nid: str, body: RunReq):
 
 
 @app.get("/api/runs/{rid}")
-def get_run(rid: str):
-    r = db.query_one("SELECT * FROM node_runs WHERE id=?", (rid,))
+def get_run(rid: str, request: Request):
+    r = authz.require_run_permission(auth.require_actor(request), rid, "job.read")
     if not r:
         raise HTTPException(404, "运行不存在")
     outs = db.query("SELECT asset_id, output_json FROM run_outputs WHERE run_id=?", (rid,))
@@ -1470,7 +1537,9 @@ def get_run(rid: str):
 
 
 @app.get("/api/runs/{rid}/events")
-def run_events(rid: str):
+def run_events(rid: str, request: Request):
+    authz.require_run_permission(auth.require_actor(request), rid, "job.read")
+
     def gen():
         deadline = time.time() + 60
         last = None
@@ -1494,7 +1563,8 @@ def run_events(rid: str):
 
 
 @app.post("/api/graphs/{gid}/run-downstream")
-def run_downstream(gid: str, body: dict):
+def run_downstream(gid: str, body: dict, request: Request):
+    authz.require_graph_permission(auth.require_actor(request), gid, "generation.run")
     from_node = body.get("from_node_id")
     if not from_node or not db.query_one("SELECT id FROM nodes WHERE id=?", (from_node,)):
         raise HTTPException(404, "起始节点不存在")
@@ -1510,7 +1580,9 @@ def run_downstream(gid: str, body: dict):
 
 # ---------------- models ----------------
 @app.get("/api/models")
-def models():
+def models(request: Request):
+    # 只读清单：任何已登录用户都需要（创作者要选模型）
+    authz.require_capability(auth.require_actor(request), "model.read")
     return registry.get_models()
 
 
@@ -1540,7 +1612,8 @@ class ModelUpdate(BaseModel):
 
 
 @app.post("/api/models", status_code=201)
-def create_model_api(m: ModelCreate):
+def create_model_api(m: ModelCreate, request: Request):
+    authz.require_platform(auth.require_actor(request), "model.manage")
     try:
         return registry.create_model(m.model_dump())
     except ValueError as e:
@@ -1548,7 +1621,8 @@ def create_model_api(m: ModelCreate):
 
 
 @app.get("/api/models/{model_id}")
-def get_model_api(model_id: str):
+def get_model_api(model_id: str, request: Request):
+    authz.require_capability(auth.require_actor(request), "model.read")
     m = registry.get_model(model_id)
     if not m:
         raise HTTPException(404, "模型不存在")
@@ -1556,7 +1630,8 @@ def get_model_api(model_id: str):
 
 
 @app.put("/api/models/{model_id}")
-def update_model_api(model_id: str, patch: ModelUpdate):
+def update_model_api(model_id: str, patch: ModelUpdate, request: Request):
+    authz.require_platform(auth.require_actor(request), "model.manage")
     try:
         m = registry.update_model(model_id, patch.model_dump(exclude_unset=True))
     except ValueError as e:
@@ -1567,7 +1642,8 @@ def update_model_api(model_id: str, patch: ModelUpdate):
 
 
 @app.delete("/api/models/{model_id}")
-def delete_model_api(model_id: str):
+def delete_model_api(model_id: str, request: Request):
+    authz.require_platform(auth.require_actor(request), "model.manage")
     registry.delete_model(model_id)
     return {"ok": True}
 
@@ -1589,13 +1665,15 @@ class ProviderUpdate(BaseModel):
 
 
 @app.get("/api/providers")
-def list_providers_api():
+def list_providers_api(request: Request):
+    authz.require_platform(auth.require_actor(request), "provider.manage")
     return [{"id": p["id"], "name": p["name"], "base_url": p["base_url"], "enabled": p["enabled"],
              "has_api_key": bool(p.get("api_key"))} for p in registry.list_providers()]
 
 
 @app.post("/api/providers", status_code=201)
-def create_provider_api(p: ProviderCreate):
+def create_provider_api(p: ProviderCreate, request: Request):
+    authz.require_platform(auth.require_actor(request), "provider.manage")
     try:
         return registry.create_provider(p.model_dump())
     except ValueError as e:
@@ -1603,7 +1681,8 @@ def create_provider_api(p: ProviderCreate):
 
 
 @app.put("/api/providers/{pid}")
-def update_provider_api(pid: str, patch: ProviderUpdate):
+def update_provider_api(pid: str, patch: ProviderUpdate, request: Request):
+    authz.require_platform(auth.require_actor(request), "provider.manage")
     prov = registry.update_provider(pid, patch.model_dump(exclude_unset=True))
     if not prov:
         raise HTTPException(404, "服务商不存在")
@@ -1611,13 +1690,15 @@ def update_provider_api(pid: str, patch: ProviderUpdate):
 
 
 @app.delete("/api/providers/{pid}")
-def delete_provider_api(pid: str):
+def delete_provider_api(pid: str, request: Request):
+    authz.require_platform(auth.require_actor(request), "provider.manage")
     registry.delete_provider(pid)
     return {"ok": True}
 
 
 @app.post("/api/providers/{pid}/test")
-def test_provider_api(pid: str):
+def test_provider_api(pid: str, request: Request):
+    authz.require_platform(auth.require_actor(request), "provider.manage")
     p = registry.get_provider(pid)
     if not p:
         raise HTTPException(404, "服务商不存在")
@@ -1639,7 +1720,8 @@ def test_provider_api(pid: str):
 
 # ---------------- image tools（节点悬浮工具栏意图） ----------------
 @app.get("/api/image-tools/intents")
-def image_tool_intents():
+def image_tool_intents(request: Request):
+    authz.require_capability(auth.require_actor(request), "model.read")
     """返回所有图片处理意图，以及每个意图当前是否可用（依赖 enabled 且含对应 editing_mode 的模型）。"""
     from .generators import image as image_gen
     import copy
@@ -1678,7 +1760,11 @@ class ImageToolRun(BaseModel):
 
 
 @app.post("/api/image-tools/run")
-def image_tool_run(body: ImageToolRun):
+def image_tool_run(body: ImageToolRun, request: Request):
+    actor = auth.require_actor(request)
+    node = authz.require_node_permission(actor, body.node_id, "generation.run")
+    pid = (node.get("project") or {}).get("id")
+    authz.assert_assets_in_project(pid, [body.asset_id] if body.asset_id else [], field="image_tool")
     n = db.query_one("SELECT id,type,graph_id FROM nodes WHERE id=?", (body.node_id,))
     if not n:
         raise HTTPException(404, "节点不存在")
@@ -1719,7 +1805,9 @@ def image_tool_run(body: ImageToolRun):
 
 # ---------------- layout / export ----------------
 @app.post("/api/projects/{pid}/layout/export")
-def export_layout(pid: str, body: dict):
+def export_layout(pid: str, body: dict, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.export")
+    authz.assert_assets_in_project(pid, [body.get("base_asset_id")], field="layout_export")
     """分层排版导出：基于生成图资产 + 可编辑文字层，重新合成最终 PNG。"""
     base_asset = body.get("base_asset_id")
     if not base_asset:
@@ -1757,7 +1845,8 @@ def export_layout(pid: str, body: dict):
 
 
 @app.get("/api/projects/{pid}/export")
-def export_project(pid: str):
+def export_project(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.export")
     g = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     nodes = db.query("SELECT id,type,position_json,current_version,status FROM nodes WHERE graph_id=?", (g["id"],))
     edges = db.query("SELECT from_node,from_port,to_node,to_port,semantic FROM edges WHERE graph_id=?", (g["id"],))
@@ -1778,7 +1867,8 @@ def export_project(pid: str):
 
 
 @app.get("/api/projects/{pid}/export-package")
-def export_package(pid: str):
+def export_package(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.export")
     g = db.query_one("SELECT * FROM graphs WHERE project_id=?", (pid,))
     nodes = db.query("SELECT id,type,position_json,current_version,status FROM nodes WHERE graph_id=?", (g["id"],))
     edges = db.query("SELECT from_node,from_port,to_node,to_port,semantic FROM edges WHERE graph_id=?", (g["id"],))
@@ -1808,7 +1898,8 @@ class AgentPlanReq(BaseModel):
 
 
 @app.post("/api/projects/{pid}/agent/plan")
-def agent_plan(pid: str, body: AgentPlanReq):
+def agent_plan(pid: str, body: AgentPlanReq, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.write")
     g = db.query_one("SELECT current_version FROM graphs WHERE project_id=?", (pid,))
     plan = {
         "instruction": body.instruction,
@@ -1833,32 +1924,45 @@ import os as _os
 _DIST = _os.path.normpath(_os.path.join(_os.path.dirname(__file__), "..", "..", "frontend", "dist"))
 # ---------------- 后台管理 ----------------
 @app.get("/api/admin/stats")
-def admin_stats():
-    def cnt(sql):
-        r = db.query_one(sql)
+def admin_stats(request: Request):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "usage.read")
+    orgs = authz.visible_org_ids(actor)
+    p_clause, p_args = authz.org_scope_clause(actor, "organization_id")
+
+    def cnt(sql, params=()):
+        r = db.query_one(sql, tuple(params))
         return r["c"] if r else 0
+
     return {
-        "projects": cnt("SELECT count(*) c FROM projects"),
-        "assets": cnt("SELECT count(*) c FROM assets"),
+        "scope": "platform" if orgs is None else "organization",
+        "projects": cnt("SELECT count(*) c FROM projects WHERE 1=1" + p_clause, p_args),
+        "assets": cnt("SELECT count(*) c FROM assets a JOIN projects p ON p.id=a.project_id WHERE 1=1" + p_clause, p_args),
         "models": cnt("SELECT count(*) c FROM model_registry"),
         "providers": cnt("SELECT count(*) c FROM providers"),
-        "runs": cnt("SELECT count(*) c FROM node_runs"),
-        "audits": cnt("SELECT count(*) c FROM audit_events"),
-        "usage_calls": cnt("SELECT count(*) c FROM usage_records"),
-        "total_cost": round(float((db.query_one("SELECT COALESCE(SUM(cost),0) c FROM usage_records") or {"c": 0})["c"] or 0), 4),
+        "runs": cnt("SELECT count(*) c FROM node_runs r JOIN nodes n ON n.id=r.node_id JOIN graphs g ON g.id=n.graph_id "
+                    "JOIN projects p ON p.id=g.project_id WHERE 1=1" + p_clause, p_args),
+        "audits": cnt("SELECT count(*) c FROM audit_events a LEFT JOIN projects p ON p.id=a.project_id WHERE 1=1" + p_clause, p_args),
+        "usage_calls": cnt("SELECT count(*) c FROM usage_records WHERE 1=1" + p_clause, p_args),
+        "total_cost": round(float((db.query_one("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE 1=1" + p_clause, tuple(p_args)) or {"c": 0})["c"] or 0), 4),
     }
 
 
 @app.get("/api/assets")
-def list_all_assets():
-    return db.query("SELECT id, project_id, role, mime, width, height, created_at, source FROM assets ORDER BY created_at DESC LIMIT 200")
+def list_all_assets(request: Request):
+    actor = auth.require_actor(request)
+    authz.require_admin_area(actor)
+    authz.require_capability(actor, "asset.read")
+    clause, args = authz.org_scope_clause(actor, "p.organization_id")
+    return db.query("SELECT a.id, a.project_id, a.role, a.mime, a.width, a.height, a.created_at, a.source "
+                    "FROM assets a JOIN projects p ON p.id=a.project_id WHERE 1=1" + clause
+                    + " ORDER BY a.created_at DESC LIMIT 200", tuple(args))
 
 
 @app.delete("/api/assets/{aid}")
-def delete_asset(aid: str):
+def delete_asset(aid: str, request: Request):
+    authz.require_asset_permission(auth.require_actor(request), aid, "asset.delete")
     a = db.query_one("SELECT object_key FROM assets WHERE id=?", (aid,))
-    if not a:
-        raise HTTPException(404, "素材不存在")
     try:
         storage.delete(a["object_key"])
     except Exception:
@@ -1868,13 +1972,24 @@ def delete_asset(aid: str):
 
 
 @app.get("/api/runs")
-def list_runs():
-    return db.query("SELECT id,node_id,model_id,status,started_at,ended_at,error_code FROM node_runs ORDER BY started_at DESC LIMIT 50")
+def list_runs(request: Request):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "job.read")
+    clause, args = authz.org_scope_clause(actor, "p.organization_id")
+    return db.query("SELECT r.id, r.node_id, r.model_id, r.status, r.started_at, r.ended_at, r.error_code "
+                    "FROM node_runs r JOIN nodes n ON n.id=r.node_id JOIN graphs g ON g.id=n.graph_id "
+                    "JOIN projects p ON p.id=g.project_id WHERE 1=1" + clause
+                    + " ORDER BY r.started_at DESC LIMIT 50", tuple(args))
 
 
 @app.get("/api/audit")
-def list_audit():
-    return db.query("SELECT * FROM audit_events ORDER BY time DESC LIMIT 100")
+def list_audit(request: Request):
+    actor = auth.require_actor(request)
+    authz.require_admin_area(actor)
+    authz.require_capability(actor, "audit.read")
+    clause, args = authz.org_scope_clause(actor, "p.organization_id")
+    return db.query("SELECT a.* FROM audit_events a LEFT JOIN projects p ON p.id=a.project_id WHERE 1=1" + clause
+                    + " ORDER BY a.time DESC LIMIT 100", tuple(args))
 
 
 # ---------------- 额度、成本与账单（模块 K 后台 / 模块 I 前台额度） ----------------
@@ -1896,6 +2011,17 @@ class PricingIn(BaseModel):
     unit_cost: float
 
 
+def _scope_credit_org(actor, body) -> str:
+    """额度操作的目标组织必须落在操作者作用域内；未指定时落到自己所属组织。"""
+    oid = body.organization_id or actor.organization_id
+    if not oid:
+        authz.require_platform(actor, "org.quota.manage")
+        oid = "org_default"
+    authz.require_organization_permission(actor, oid, "org.quota.manage")
+    body.organization_id = oid
+    return oid
+
+
 def _usage_filter(project_id=None, model_id=None, task_type=None, status=None, days=None, org_id=None):
     sql = "SELECT * FROM usage_records WHERE 1=1"
     args = []
@@ -1915,18 +2041,26 @@ def _usage_filter(project_id=None, model_id=None, task_type=None, status=None, d
 
 
 @app.get("/api/admin/usage-records")
-def admin_usage_records(project_id: Optional[str] = None, model_id: Optional[str] = None,
+def admin_usage_records(request: Request, project_id: Optional[str] = None, model_id: Optional[str] = None,
                         task_type: Optional[str] = None, status: Optional[str] = None,
                         days: Optional[int] = None, limit: int = 200):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "usage.read")
     sql, args = _usage_filter(project_id, model_id, task_type, status, days)
+    clause, cargs = authz.org_scope_clause(actor, "organization_id")
+    sql += clause
+    args = list(args) + list(cargs)
     sql += " ORDER BY created_at DESC LIMIT ?"
     return db.query(sql, tuple(args) + (int(limit),))
 
 
 @app.get("/api/admin/cost-summary")
-def admin_cost_summary(days: int = 30):
+def admin_cost_summary(request: Request, days: int = 30):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "usage.read")
     since = int(db.now()) - int(days) * 86400
-    rows = db.query("SELECT * FROM usage_records WHERE created_at>=?", (since,))
+    clause, cargs = authz.org_scope_clause(actor, "organization_id")
+    rows = db.query("SELECT * FROM usage_records WHERE created_at>=?" + clause, tuple([since] + list(cargs)))
     total_cost = round(sum(float(r["cost"] or 0) for r in rows), 4)
     succeeded = [r for r in rows if r["status"] == "succeeded"]
     failed = [r for r in rows if r["status"] != "succeeded"]
@@ -1961,15 +2095,22 @@ def admin_cost_summary(days: int = 30):
 
 
 @app.get("/api/admin/organizations")
-def admin_organizations():
-    return db.query("SELECT * FROM organizations ORDER BY created_at ASC")
+def admin_organizations(request: Request):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "org.read")
+    clause, args = authz.org_scope_clause(actor, "id")
+    rows = db.query("SELECT * FROM organizations WHERE 1=1" + clause + " ORDER BY created_at ASC", tuple(args))
+    if not actor.has("org.quota.manage"):
+        for r in rows:
+            r.pop("credit_balance", None)
+            r.pop("quota_total", None)
+            r.pop("daily_limit", None)
+    return rows
 
 
 @app.get("/api/admin/organizations/{oid}/quota")
-def admin_org_quota(oid: str):
-    o = db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
-    if not o:
-        raise HTTPException(404, "组织不存在")
+def admin_org_quota(oid: str, request: Request):
+    o = authz.require_organization_permission(auth.require_actor(request), oid, "org.quota.manage")
     used = db.query_one("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE organization_id=? AND status='succeeded' AND created_at>=?",
                         (oid, int(o["period_start"] or 0)))["c"]
     return {**o, "used_this_period": round(float(used or 0), 4),
@@ -1977,10 +2118,10 @@ def admin_org_quota(oid: str):
 
 
 @app.put("/api/admin/organizations/{oid}/quota")
-def admin_update_org_quota(oid: str, body: QuotaIn, _role: str = Depends(auth.require_permission("org.quota.manage"))):
-    o = db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
-    if not o:
-        raise HTTPException(404, "组织不存在")
+def admin_update_org_quota(oid: str, body: QuotaIn, request: Request,
+                           _role: str = Depends(auth.require_permission("org.quota.manage"))):
+    actor = auth.require_actor(request)
+    o = authz.require_organization_permission(actor, oid, "org.quota.manage")
     fields, args = [], []
     for col in ("plan", "quota_total", "daily_limit", "credit_balance"):
         v = getattr(body, col)
@@ -1989,69 +2130,86 @@ def admin_update_org_quota(oid: str, body: QuotaIn, _role: str = Depends(auth.re
     if not fields:
         return o
     db.execute(f"UPDATE organizations SET {','.join(fields)} WHERE id=?", tuple(args) + (oid,))
-    db.audit(None, "usr_default", "org.quota.update", oid)
+    db.audit(None, actor.user_id, "org.quota.update", oid)
     return db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
 
 
 @app.get("/api/admin/credit-ledger")
-def admin_credit_ledger(limit: int = 200):
-    return db.query("SELECT * FROM credit_ledger ORDER BY created_at DESC LIMIT ?", (int(limit),))
+def admin_credit_ledger(request: Request, limit: int = 200):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "org.quota.manage")
+    clause, args = authz.org_scope_clause(actor, "organization_id")
+    return db.query("SELECT * FROM credit_ledger WHERE 1=1" + clause
+                    + " ORDER BY created_at DESC LIMIT ?", tuple(list(args) + [int(limit)]))
 
 
 @app.post("/api/admin/credits/grant", status_code=201)
-def admin_credits_grant(body: CreditIn, _role: str = Depends(auth.require_permission('org.quota.manage'))):
+def admin_credits_grant(body: CreditIn, request: Request,
+                        _role: str = Depends(auth.require_permission('org.quota.manage'))):
+    actor = auth.require_actor(request)
+    _scope_credit_org(actor, body)
     if body.amount <= 0:
         raise HTTPException(422, "补发额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, abs(body.amount),
-                                     body.reason or "人工补发额度", operator_id="usr_default",
+                                     body.reason or "人工补发额度", operator_id=actor.user_id,
                                      ref_type="manual", ref_id="", user_id=body.user_id)
     if not r:
         raise HTTPException(404, "组织不存在")
-    db.audit(None, "usr_default", "credits.grant", r["id"])
+    db.audit(None, actor.user_id, "credits.grant", r["id"])
     return r
 
 
 @app.post("/api/admin/credits/deduct", status_code=201)
-def admin_credits_deduct(body: CreditIn, _role: str = Depends(auth.require_permission('org.quota.manage'))):
+def admin_credits_deduct(body: CreditIn, request: Request,
+                         _role: str = Depends(auth.require_permission('org.quota.manage'))):
+    actor = auth.require_actor(request)
+    _scope_credit_org(actor, body)
     if body.amount <= 0:
         raise HTTPException(422, "扣除额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, -abs(body.amount),
-                                     body.reason or "人工扣除额度", operator_id="usr_default",
+                                     body.reason or "人工扣除额度", operator_id=actor.user_id,
                                      ref_type="manual", ref_id="", user_id=body.user_id)
     if not r:
         raise HTTPException(404, "组织不存在")
-    db.audit(None, "usr_default", "credits.deduct", r["id"])
+    db.audit(None, actor.user_id, "credits.deduct", r["id"])
     return r
 
 
 @app.post("/api/admin/credits/refund", status_code=201)
-def admin_credits_refund(body: CreditIn, _role: str = Depends(auth.require_permission('org.quota.manage'))):
+def admin_credits_refund(body: CreditIn, request: Request,
+                         _role: str = Depends(auth.require_permission('org.quota.manage'))):
+    actor = auth.require_actor(request)
+    _scope_credit_org(actor, body)
     if body.amount <= 0:
         raise HTTPException(422, "退款额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, abs(body.amount),
-                                     body.reason or "失败任务返还额度", operator_id="usr_default",
+                                     body.reason or "失败任务返还额度", operator_id=actor.user_id,
                                      ref_type="refund", ref_id="", user_id=body.user_id)
     if not r:
         raise HTTPException(404, "组织不存在")
-    db.audit(None, "usr_default", "credits.refund", r["id"])
+    db.audit(None, actor.user_id, "credits.refund", r["id"])
     return r
 
 
 @app.put("/api/admin/models/{model_id}/pricing")
-def admin_model_pricing(model_id: str, body: PricingIn):
+def admin_model_pricing(model_id: str, body: PricingIn, request: Request):
+    actor = auth.require_actor(request)
+    authz.require_platform(actor, "model.manage")
     m = db.query_one("SELECT model_id FROM model_registry WHERE model_id=?", (model_id,))
     if not m:
         raise HTTPException(404, "模型不存在")
     db.execute("UPDATE model_registry SET unit_cost=? WHERE model_id=?", (float(body.unit_cost), model_id))
-    db.audit(None, "usr_default", "model.pricing.update", model_id)
+    db.audit(None, actor.user_id, "model.pricing.update", model_id)
     return db.query_one("SELECT * FROM model_registry WHERE model_id=?", (model_id,))
 
 
 @app.get("/api/creator/usage-summary")
-def creator_usage_summary(days: int = 30):
-    o = metering.get_org(None) or {}
+def creator_usage_summary(request: Request, days: int = 30):
+    actor = auth.require_actor(request)
+    o = metering.get_org(actor.organization_id) or {}
     since = int(db.now()) - int(days) * 86400
-    rows = db.query("SELECT * FROM usage_records WHERE created_at>=?", (since,))
+    # 个人额度视图：用量只统计本人，余额是所属组织的额度池
+    rows = db.query("SELECT * FROM usage_records WHERE created_at>=? AND user_id=?", (since, actor.user_id))
     this_month = [r for r in rows if r["created_at"] >= int(o.get("period_start") or 0)]
     by_model: dict = {}
     for r in rows:
@@ -2067,17 +2225,19 @@ def creator_usage_summary(days: int = 30):
         "calls_this_month": len(this_month),
         "images_this_month": sum(int(r["output_images"] or 0) for r in this_month),
         "window_days": days,
+        "usage_scope": "self",
         "window_cost": round(sum(float(r["cost"] or 0) for r in rows), 4),
         "by_model": sorted(by_model.values(), key=lambda x: -x["cost"]),
     }
 
 
 @app.get("/api/creator/usage-records")
-def creator_usage_records(days: int = 30, limit: int = 100):
+def creator_usage_records(request: Request, days: int = 30, limit: int = 100):
+    actor = auth.require_actor(request)
     since = int(db.now()) - int(days) * 86400
     return db.query("SELECT id,project_id,model_id,task_type,output_images,cost,status,created_at "
-                    "FROM usage_records WHERE created_at>=? ORDER BY created_at DESC LIMIT ?",
-                    (since, int(limit)))
+                    "FROM usage_records WHERE created_at>=? AND user_id=? ORDER BY created_at DESC LIMIT ?",
+                    (since, actor.user_id, int(limit)))
 
 
 # ---------------- 审核与合规中心（模块 J）+ 站内通知 ----------------
@@ -2153,21 +2313,23 @@ def _review_gate(pid: str, raise_error: bool = True):
 
 
 @app.get("/api/projects/{pid}/compliance-scan")
-def project_compliance_scan(pid: str):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def project_compliance_scan(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.read")
     return compliance.scan_many(compliance.project_texts(pid, db))
 
 
 @app.get("/api/projects/{pid}/review-gate")
-def project_review_gate(pid: str):
+def project_review_gate(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "project.read")
     return _review_gate(pid, raise_error=False)
 
 
 @app.post("/api/projects/{pid}/reviews", status_code=201)
-def create_review(pid: str, body: ReviewIn):
-    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
-        raise HTTPException(404, "项目不存在")
+def create_review(pid: str, body: ReviewIn, request: Request):
+    actor = auth.require_actor(request)
+    authz.require_project_permission(actor, pid, "review.submit")
+    if body.asset_id:
+        authz.assert_assets_in_project(pid, [body.asset_id], field="review")
     if body.target_type not in compliance.TARGET_TYPES:
         raise HTTPException(422, f"不支持审核对象类型 {body.target_type}")
     scanned = compliance.scan_many(compliance.project_texts(pid, db))
@@ -2185,19 +2347,26 @@ def create_review(pid: str, body: ReviewIn):
 
 
 @app.get("/api/projects/{pid}/reviews")
-def list_project_reviews(pid: str):
+def list_project_reviews(pid: str, request: Request):
+    authz.require_project_permission(auth.require_actor(request), pid, "review.read")
     rows = db.query("SELECT * FROM reviews WHERE project_id=? ORDER BY created_at DESC", (pid,))
     return [_review_public(r) for r in rows]
 
 
 @app.get("/api/admin/reviews")
-def admin_reviews(status: Optional[str] = None, project_id: Optional[str] = None):
-    sql, args = "SELECT * FROM reviews WHERE 1=1", []
+def admin_reviews(request: Request, status: Optional[str] = None, project_id: Optional[str] = None):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "review.queue")
+    clause, cargs = authz.org_scope_clause(actor, "p.organization_id")
+    sql = ("SELECT r.* FROM reviews r JOIN projects p ON p.id=r.project_id WHERE 1=1" + clause)
+    args = list(cargs)
     if status:
-        sql += " AND status=?"; args.append(status)
+        sql += " AND r.status=?"; args.append(status)
     if project_id:
-        sql += " AND project_id=?"; args.append(project_id)
-    sql += " ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, created_at DESC LIMIT 300"
+        authz.require_project_permission(actor, project_id, "review.read")
+        sql += " AND r.project_id=?"; args.append(project_id)
+    sql += (" ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, "
+            "r.created_at DESC LIMIT 300")
     rows = db.query(sql, tuple(args))
     out = []
     for r in rows:
@@ -2208,19 +2377,25 @@ def admin_reviews(status: Optional[str] = None, project_id: Optional[str] = None
     return out
 
 
-@app.get("/api/admin/reviews/{rid}")
-def admin_review_detail(rid: str):
+def _review_detail(rid: str) -> dict:
+    """内部使用：不带授权检查，调用方必须先完成作用域校验。"""
     r = db.query_one("SELECT * FROM reviews WHERE id=?", (rid,))
     if not r:
         raise HTTPException(404, "审核记录不存在")
     d = _review_public(r)
-    p = db.query_one("SELECT name FROM projects WHERE id=?", (r["project_id"],))
+    p = db.query_one("SELECT name,organization_id FROM projects WHERE id=?", (r["project_id"],))
     d["project_name"] = (p or {}).get("name") or r["project_id"]
     d["project_texts"] = compliance.project_texts(r["project_id"], db)
     return d
 
 
-def _decide_review(rid: str, status: str, reason: str, assigned_to: Optional[str] = None):
+@app.get("/api/admin/reviews/{rid}")
+def admin_review_detail(rid: str, request: Request):
+    authz.require_review_permission(auth.require_actor(request), rid, "review.read")
+    return _review_detail(rid)
+
+
+def _decide_review(rid: str, status: str, reason: str, assigned_to: Optional[str] = None, actor_id: str = "system"):
     r = db.query_one("SELECT * FROM reviews WHERE id=?", (rid,))
     if not r:
         raise HTTPException(404, "审核记录不存在")
@@ -2233,29 +2408,41 @@ def _decide_review(rid: str, status: str, reason: str, assigned_to: Optional[str
         db.execute("UPDATE reviews SET status=?, reason=?, decided_by=?, decided_at=?, assigned_to=COALESCE(?,assigned_to), updated_at=? WHERE id=?",
                    (status, reason or "", "usr_default", int(db.now()), assigned_to, int(db.now()), rid))
     label = {"approved": "审核通过", "returned": "审核退回", "rejected": "审核拒绝", "in_review": "已领取审核"}[status]
-    notify("usr_default", "review", f"{label}：{r['title']}", (reason or "")[:200], ref_type="review", ref_id=rid)
-    db.audit(r["project_id"], "usr_default", f"review.{status}", rid)
-    return admin_review_detail(rid)
+    submitter = r.get("submitted_by") or "usr_default"
+    notify(submitter, "review", f"{label}：{r['title']}", (reason or "")[:200], ref_type="review", ref_id=rid)
+    db.audit(r["project_id"], actor_id, f"review.{status}", rid)
+    return _review_detail(rid)
 
 
 @app.post("/api/admin/reviews/{rid}/claim")
-def review_claim(rid: str, body: ReviewDecisionIn):
-    return _decide_review(rid, "in_review", "", body.assigned_to)
+def review_claim(rid: str, body: ReviewDecisionIn, request: Request):
+    actor = auth.require_actor(request)
+    authz.require_review_permission(actor, rid, "review.decide")
+    return _decide_review(rid, "in_review", "", body.assigned_to, actor_id=actor.user_id)
 
 
 @app.post("/api/admin/reviews/{rid}/approve")
-def review_approve(rid: str, body: ReviewDecisionIn, _role: str = Depends(auth.require_permission("review.decide"))):
-    return _decide_review(rid, "approved", body.reason, body.assigned_to)
+def review_approve(rid: str, body: ReviewDecisionIn, request: Request,
+                   _role: str = Depends(auth.require_permission("review.decide"))):
+    actor = auth.require_actor(request)
+    authz.require_review_permission(actor, rid, "review.decide")
+    return _decide_review(rid, "approved", body.reason, body.assigned_to, actor_id=actor.user_id)
 
 
 @app.post("/api/admin/reviews/{rid}/return")
-def review_return(rid: str, body: ReviewDecisionIn, _role: str = Depends(auth.require_permission("review.decide"))):
-    return _decide_review(rid, "returned", body.reason, body.assigned_to)
+def review_return(rid: str, body: ReviewDecisionIn, request: Request,
+                  _role: str = Depends(auth.require_permission("review.decide"))):
+    actor = auth.require_actor(request)
+    authz.require_review_permission(actor, rid, "review.decide")
+    return _decide_review(rid, "returned", body.reason, body.assigned_to, actor_id=actor.user_id)
 
 
 @app.post("/api/admin/reviews/{rid}/reject")
-def review_reject(rid: str, body: ReviewDecisionIn, _role: str = Depends(auth.require_permission("review.decide"))):
-    return _decide_review(rid, "rejected", body.reason, body.assigned_to)
+def review_reject(rid: str, body: ReviewDecisionIn, request: Request,
+                  _role: str = Depends(auth.require_permission("review.decide"))):
+    actor = auth.require_actor(request)
+    authz.require_review_permission(actor, rid, "review.decide")
+    return _decide_review(rid, "rejected", body.reason, body.assigned_to, actor_id=actor.user_id)
 
 
 # ---------------- 用户、组织与权限（模块 B 后台） ----------------
@@ -2284,6 +2471,52 @@ class RoleAssignIn(BaseModel):
     role: str
 
 
+class AssignOrgIn(BaseModel):
+    organization_id: str
+    reason: str = ""
+
+
+@app.get("/api/admin/projects/unassigned")
+def admin_unassigned_projects(request: Request):
+    """归属不明的历史项目（仅平台级角色可见，组织级角色一律不可见）。"""
+    actor = auth.require_actor(request)
+    authz.require_platform(actor, "project.read")
+    rows = db.query("SELECT id,name,owner_id,tenant_id,status,created_at FROM projects "
+                    "WHERE organization_id IS NULL OR organization_id='' ORDER BY created_at DESC")
+    owners = {}
+    for r in rows:
+        if r["owner_id"] and r["owner_id"] not in owners:
+            u = db.query_one("SELECT id,name,organization_id FROM users WHERE id=?", (r["owner_id"],))
+            ms = db.query("SELECT DISTINCT organization_id FROM memberships WHERE user_id=? AND organization_id IS NOT NULL",
+                          (r["owner_id"],))
+            owners[r["owner_id"]] = {
+                "exists": bool(u), "name": (u or {}).get("name"),
+                "user_organization_id": (u or {}).get("organization_id"),
+                "member_organizations": [m["organization_id"] for m in ms],
+            }
+        r["owner"] = owners.get(r["owner_id"]) if r["owner_id"] else None
+    mig = db.query("SELECT name,finished_at,scanned,resolved,unresolved,report_path FROM migrations "
+                   "ORDER BY finished_at DESC LIMIT 1")
+    return {"count": len(rows), "projects": rows, "last_migration": mig[0] if mig else None}
+
+
+@app.put("/api/admin/projects/{pid}/organization")
+def admin_assign_project_org(pid: str, body: AssignOrgIn, request: Request):
+    """管理员为归属不明的项目指定组织；这是让它重新可被组织成员访问的唯一途径。"""
+    actor = auth.require_actor(request)
+    authz.require_platform(actor, "member.manage")
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    org = db.query_one("SELECT id FROM organizations WHERE id=?", (body.organization_id,))
+    if not org:
+        raise HTTPException(404, "组织不存在")
+    before = (db.query_one("SELECT organization_id FROM projects WHERE id=?", (pid,)) or {}).get("organization_id")
+    db.execute("UPDATE projects SET organization_id=?, updated_at=? WHERE id=?", (body.organization_id, db.now(), pid))
+    db.audit(pid, actor.user_id, "project.organization.assign", pid)
+    return {"ok": True, "project_id": pid, "before": before, "organization_id": body.organization_id,
+            "reason": body.reason}
+
+
 @app.get("/api/admin/roles")
 def admin_roles():
     return {"roles": rbac.roles(), "permissions": rbac.PERMISSIONS}
@@ -2295,7 +2528,10 @@ def admin_permissions():
 
 
 @app.post("/api/admin/organizations", status_code=201)
-def admin_create_organization(body: OrganizationIn, _role: str = Depends(auth.require_permission("member.manage"))):
+def admin_create_organization(body: OrganizationIn, request: Request,
+                              _role: str = Depends(auth.require_permission("member.manage"))):
+    actor = auth.require_actor(request)
+    authz.require_platform(actor, "member.manage")
     oid = body.id or db.gen_id("org")
     if db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
         raise HTTPException(400, "组织 ID 已存在")
@@ -2311,34 +2547,52 @@ def admin_create_organization(body: OrganizationIn, _role: str = Depends(auth.re
 
 
 @app.put("/api/admin/organizations/{oid}")
-def admin_update_organization(oid: str, body: OrganizationIn, _role: str = Depends(auth.require_permission("member.manage"))):
-    if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
-        raise HTTPException(404, "组织不存在")
+def admin_update_organization(oid: str, body: OrganizationIn, request: Request,
+                              _role: str = Depends(auth.require_permission("member.manage"))):
+    actor = auth.require_actor(request)
+    authz.require_organization_permission(actor, oid, "member.manage")
     db.execute("UPDATE organizations SET name=?, plan=? WHERE id=?", (body.name, body.plan, oid))
     db.audit(None, "usr_default", "org.update", oid)
     return db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
 
 
 @app.get("/api/admin/workspaces")
-def admin_workspaces(organization_id: Optional[str] = None):
+def admin_workspaces(request: Request, organization_id: Optional[str] = None):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "member.manage")
     sql, args = "SELECT * FROM workspaces WHERE 1=1", []
     if organization_id:
+        authz.require_organization_permission(actor, organization_id, "member.manage")
         sql += " AND organization_id=?"; args.append(organization_id)
+    else:
+        clause, cargs = authz.org_scope_clause(actor, "organization_id")
+        sql += clause; args += list(cargs)
     return db.query(sql + " ORDER BY created_at ASC", tuple(args))
 
 
 @app.post("/api/admin/organizations/{oid}/workspaces", status_code=201)
-def admin_create_workspace(oid: str, body: WorkspaceIn, _role: str = Depends(auth.require_permission("member.manage"))):
-    if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
-        raise HTTPException(404, "组织不存在")
+def admin_create_workspace(oid: str, body: WorkspaceIn, request: Request,
+                           _role: str = Depends(auth.require_permission("member.manage"))):
+    authz.require_organization_permission(auth.require_actor(request), oid, "member.manage")
     wid = body.id or db.gen_id("wsp")
     db.execute("INSERT INTO workspaces(id,organization_id,name,created_at) VALUES(?,?,?,?)",
                (wid, oid, body.name, int(db.now())))
     return db.query_one("SELECT * FROM workspaces WHERE id=?", (wid,))
 
 
-def _member_rows() -> list:
-    users = db.query("SELECT * FROM users ORDER BY created_at ASC, id ASC")
+def _member_rows(actor=None) -> list:
+    sql = ("SELECT DISTINCT u.* FROM users u LEFT JOIN memberships m ON m.user_id=u.id WHERE 1=1")
+    args: list = []
+    if actor is not None:
+        orgs = authz.visible_org_ids(actor)
+        if orgs is not None:
+            if not orgs:
+                sql += " AND 1=0"
+            else:
+                ph = ",".join(["?"] * len(orgs))
+                sql += f" AND (u.organization_id IN ({ph}) OR m.organization_id IN ({ph}))"
+                args = list(orgs) + list(orgs)
+    users = db.query(sql + " ORDER BY u.created_at ASC, u.id ASC", tuple(args))
     usages = db.query("SELECT user_id, count(*) calls, COALESCE(SUM(cost),0) cost, COALESCE(SUM(output_images),0) images, "
                       "COALESCE(SUM(duration_ms),0) ms FROM usage_records GROUP BY user_id")
     umap = {u["user_id"]: u for u in usages}
@@ -2364,12 +2618,13 @@ def _member_rows() -> list:
 
 
 @app.get("/api/admin/users")
-def admin_users(_role: str = Depends(auth.require_permission("member.manage"))):
-    return _member_rows()
+def admin_users(request: Request, _role: str = Depends(auth.require_permission("member.manage"))):
+    return _member_rows(auth.require_actor(request))
 
 
 @app.get("/api/admin/users/{uid}/usage")
-def admin_user_usage(uid: str, days: int = 30):
+def admin_user_usage(uid: str, request: Request, days: int = 30):
+    authz.require_user_permission(auth.require_actor(request), uid, "member.manage")
     since = int(db.now()) - int(days) * 86400
     rows = db.query("SELECT * FROM usage_records WHERE user_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 200",
                     (uid, since))
@@ -2386,9 +2641,10 @@ def admin_user_usage(uid: str, days: int = 30):
 
 
 @app.post("/api/admin/organizations/{oid}/members", status_code=201)
-def admin_add_member(oid: str, body: MemberIn, _role: str = Depends(auth.require_permission("member.manage"))):
-    if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
-        raise HTTPException(404, "组织不存在")
+def admin_add_member(oid: str, body: MemberIn, request: Request,
+                     _role: str = Depends(auth.require_permission("member.manage"))):
+    actor = auth.require_actor(request)
+    authz.require_organization_permission(actor, oid, "member.manage")
     known_roles = {r["id"] for r in rbac.roles()} | {al for r in rbac.roles() for al in r["aliases"]}
     if body.role not in known_roles:
         raise HTTPException(422, f"未知角色 {body.role}")
@@ -2409,10 +2665,18 @@ def admin_add_member(oid: str, body: MemberIn, _role: str = Depends(auth.require
 
 
 @app.put("/api/admin/memberships/{mid}/role")
-def admin_set_member_role(mid: str, body: RoleAssignIn, _role: str = Depends(auth.require_permission("member.manage"))):
-    m = db.query_one("SELECT * FROM memberships WHERE id=?", (mid,))
-    if not m:
-        raise HTTPException(404, "成员关系不存在")
+def admin_set_member_role(mid: str, body: RoleAssignIn, request: Request,
+                          _role: str = Depends(auth.require_permission("member.manage"))):
+    actor = auth.require_actor(request)
+    m = authz.require_membership_permission(actor, mid, "member.manage")
+    # 不允许把自己所属组织的最后一名管理员降级（避免组织变成无人可管）
+    if m["user_id"] == actor.user_id and rbac.resolve_role(body.role) != actor.role \
+            and not rbac.is_platform_role(actor.role):
+        others = db.query("SELECT id FROM memberships WHERE organization_id=? AND user_id!=? AND role IN "
+                          "('super_admin','platform_admin','organization_admin')",
+                          (m["organization_id"], actor.user_id))
+        if not others:
+            raise HTTPException(422, "本组织没有其他管理员，不能修改自己的角色")
     known = {r["id"] for r in rbac.roles()} | {a for r in rbac.roles() for a in r["aliases"]}
     if body.role not in known:
         raise HTTPException(422, f"未知角色 {body.role}")
@@ -2429,10 +2693,11 @@ class ResetPasswordIn(BaseModel):
 
 
 @app.post("/api/admin/users/{uid}/reset-password")
-def admin_reset_password(uid: str, body: ResetPasswordIn, _actor=Depends(auth.require_permission("member.manage"))):
+def admin_reset_password(uid: str, body: ResetPasswordIn, request: Request,
+                         _actor=Depends(auth.require_permission("member.manage"))):
     """管理员重置成员密码；重置后该成员所有既有会话立即失效。"""
-    if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
-        raise HTTPException(404, "用户不存在")
+    scope_actor = auth.require_actor(request)
+    authz.require_user_permission(scope_actor, uid, "member.manage")
     try:
         auth.set_password(uid, body.new_password)
     except ValueError as e:
@@ -2444,47 +2709,54 @@ def admin_reset_password(uid: str, body: ResetPasswordIn, _actor=Depends(auth.re
 
 
 @app.post("/api/admin/users/{uid}/disable")
-def admin_disable_user(uid: str, _role: str = Depends(auth.require_permission("member.manage"))):
-    if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
-        raise HTTPException(404, "用户不存在")
+def admin_disable_user(uid: str, request: Request, _role: str = Depends(auth.require_permission("member.manage"))):
+    actor = auth.require_actor(request)
+    authz.require_user_permission(actor, uid, "member.manage")
+    if uid == actor.user_id:
+        raise HTTPException(422, "不能禁用自己")
     db.execute("UPDATE users SET status='disabled' WHERE id=?", (uid,))
     db.execute("UPDATE memberships SET status='disabled', updated_at=? WHERE user_id=?", (int(db.now()), uid))
-    db.audit(None, "usr_default", "member.disable", uid)
+    auth.revoke_all_sessions(uid)
+    db.audit(None, actor.user_id, "member.disable", uid)
     return {"user_id": uid, "status": "disabled"}
 
 
 @app.post("/api/admin/users/{uid}/enable")
-def admin_enable_user(uid: str, _role: str = Depends(auth.require_permission("member.manage"))):
-    if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
-        raise HTTPException(404, "用户不存在")
+def admin_enable_user(uid: str, request: Request, _role: str = Depends(auth.require_permission("member.manage"))):
+    actor = auth.require_actor(request)
+    authz.require_user_permission(actor, uid, "member.manage")
     db.execute("UPDATE users SET status='active' WHERE id=?", (uid,))
     db.execute("UPDATE memberships SET status='active', updated_at=? WHERE user_id=?", (int(db.now()), uid))
-    db.audit(None, "usr_default", "member.enable", uid)
+    db.audit(None, actor.user_id, "member.enable", uid)
     return {"user_id": uid, "status": "active"}
 
 
 @app.get("/api/creator/notifications")
-def creator_notifications(unread_only: bool = False, limit: int = 50):
-    sql = "SELECT * FROM notifications WHERE 1=1"
-    args: list = []
+def creator_notifications(request: Request, unread_only: bool = False, limit: int = 50):
+    actor = auth.require_actor(request)
+    authz.require_capability(actor, "notification.read")
+    sql = "SELECT * FROM notifications WHERE user_id=?"
+    args: list = [actor.user_id]
     if unread_only:
         sql += " AND read=0"
     sql += " ORDER BY created_at DESC LIMIT ?"
     args.append(int(limit))
     rows = db.query(sql, tuple(args))
-    unread = (db.query_one("SELECT count(*) c FROM notifications WHERE read=0") or {"c": 0})["c"]
+    unread = (db.query_one("SELECT count(*) c FROM notifications WHERE read=0 AND user_id=?", (actor.user_id,)) or {"c": 0})["c"]
     return {"unread": unread, "items": rows}
 
 
 @app.post("/api/creator/notifications/{nid}/read")
-def read_notification(nid: str):
+def read_notification(nid: str, request: Request):
+    authz.require_notification_permission(auth.require_actor(request), nid, "notification.read")
     db.execute("UPDATE notifications SET read=1 WHERE id=?", (nid,))
     return {"ok": True}
 
 
 @app.post("/api/creator/notifications/read-all")
-def read_all_notifications():
-    db.execute("UPDATE notifications SET read=1 WHERE read=0")
+def read_all_notifications(request: Request):
+    actor = auth.require_actor(request)
+    db.execute("UPDATE notifications SET read=1 WHERE read=0 AND user_id=?", (actor.user_id,))
     return {"ok": True}
 
 

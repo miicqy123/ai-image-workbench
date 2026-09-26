@@ -34,3 +34,7 @@ _server_*.log
 
 # scratch logs
 _*.log
+
+# 本地凭据文件（绝不入库）
+.secrets/
+*.local.txt

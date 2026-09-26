@@ -5,21 +5,24 @@ import { fileUrl } from './api'
 
 interface Stats { projects: number; assets: number; models: number; providers: number; runs: number; audits: number; usage_calls?: number; total_cost?: number }
 
+// perm 表示访问该页签所需的后端权限；没有权限的页签直接不展示（后端仍会二次校验）
 const TABS = [
-  { key: 'projects', label: '项目' },
-  { key: 'runs', label: '运行记录' },
-  { key: 'audit', label: '审计日志' },
-  { key: 'assets', label: '素材' },
-  { key: 'templates', label: '模板中心' },
-  { key: 'prompts', label: 'Prompt 管理' },
-  { key: 'models', label: '模型 / 服务商' },
-  { key: 'usage', label: '用量与成本' },
-  { key: 'quota', label: '额度与组织' },
-  { key: 'reviews', label: '审核中心' },
-  { key: 'users', label: '用户与权限' },
+  { key: 'projects', label: '项目', perm: 'project.read' },
+  { key: 'runs', label: '运行记录', perm: 'job.read' },
+  { key: 'audit', label: '审计日志', perm: 'audit.read' },
+  { key: 'assets', label: '素材', perm: 'asset.read' },
+  { key: 'templates', label: '模板中心', perm: 'template.manage' },
+  { key: 'prompts', label: 'Prompt 管理', perm: 'prompt.manage' },
+  { key: 'models', label: '模型 / 服务商', perm: 'model.manage' },
+  { key: 'usage', label: '用量与成本', perm: 'usage.read' },
+  { key: 'quota', label: '额度与组织', perm: 'org.quota.manage' },
+  { key: 'reviews', label: '审核中心', perm: 'review.queue' },
+  { key: 'users', label: '用户与权限', perm: 'member.manage' },
 ] as const
 
-export default function Admin({ onBack }: { onBack: () => void }) {
+export default function Admin({ onBack, permissions = [] }: { onBack: () => void; permissions?: string[] }) {
+  const can = (perm: string) => permissions.length === 0 || permissions.includes(perm)
+  const visibleTabs = TABS.filter((t) => can(t.perm))
   const [stats, setStats] = useState<Stats | null>(null)
   const [projects, setProjects] = useState<any[]>([])
   const [runs, setRuns] = useState<any[]>([])
@@ -39,27 +42,34 @@ export default function Admin({ onBack }: { onBack: () => void }) {
   const [users, setUsers] = useState<any[]>([])
   const [roleCat, setRoleCat] = useState<any>(null)
   const [workspaces, setWorkspaces] = useState<any[]>([])
+  const [unassigned, setUnassigned] = useState<any>(null)
   const [tab, setTab] = useState<'projects' | 'runs' | 'audit' | 'models' | 'assets' | 'templates' | 'prompts' | 'usage' | 'quota' | 'reviews' | 'users'>('projects')
   const [showModels, setShowModels] = useState(false)
 
+  // 权限不足的页签会对后端返回 403；这里逐项兜底，避免一个 403 让整个后台白屏
+  const safe = async <T,>(p: Promise<T>, fallback: T): Promise<T> => {
+    try { return await p } catch { return fallback }
+  }
+
   const refresh = async () => {
-    setStats(await api.adminStats())
-    setProjects(await api.listProjects())
-    setRuns(await api.listRuns())
-    setAudits(await api.listAudit())
-    setModels(await api.listModels())
-    setProviders(await api.listProviders())
-    setAssets(await api.listAllAssets())
-    setTemplates(await api.adminTemplates())
-    setPrompts(await api.listPromptTemplates())
-    setUsage(await api.adminUsageRecords('?limit=200'))
-    setCost(await api.adminCostSummary(30))
-    setOrgs(await api.adminOrganizations())
-    setLedger(await api.adminCreditLedger())
-    setReviews(await api.adminReviews(reviewFilter ? `?status=${reviewFilter}` : ''))
-    setUsers(await api.adminUsers())
-    setRoleCat(await api.adminRoles())
-    setWorkspaces(await api.adminWorkspaces())
+    setStats(await safe(api.adminStats(), null as any))
+    setProjects(await safe(api.listProjects(), []))
+    setRuns(await safe(api.listRuns(), []))
+    setAudits(await safe(api.listAudit(), []))
+    setModels(await safe(api.listModels(), []))
+    setProviders(can('provider.manage') ? await safe(api.listProviders(), []) : [])
+    setAssets(await safe(api.listAllAssets(), []))
+    setTemplates(can('template.manage') ? await safe(api.adminTemplates(), []) : [])
+    setPrompts(can('prompt.manage') ? await safe(api.listPromptTemplates(), []) : [])
+    setUsage(await safe(api.adminUsageRecords('?limit=200'), []))
+    setCost(await safe(api.adminCostSummary(30), null))
+    setOrgs(await safe(api.adminOrganizations(), []))
+    setLedger(can('org.quota.manage') ? await safe(api.adminCreditLedger(), []) : [])
+    setReviews(await safe(api.adminReviews(reviewFilter ? `?status=${reviewFilter}` : ''), []))
+    setUsers(can('member.manage') ? await safe(api.adminUsers(), []) : [])
+    setRoleCat(await safe(api.adminRoles(), null))
+    setWorkspaces(can('member.manage') ? await safe(api.adminWorkspaces(), []) : [])
+    setUnassigned(await safe(api.adminUnassignedProjects(), null))
   }
   useEffect(() => { refresh() }, [])
 
@@ -83,12 +93,34 @@ export default function Admin({ onBack }: { onBack: () => void }) {
       </div>
 
       <div className="admin-tabs">
-        {TABS.map((t) => <button key={t.key} className={`tag-chip ${tab === t.key ? 'on' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>)}
+        {visibleTabs.map((t) => <button key={t.key} className={`tag-chip ${tab === t.key ? 'on' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>)}
       </div>
 
       <div className="admin-body">
         {tab === 'projects' && (
-          <table className="admin-table">
+          <div>
+            {unassigned && (unassigned.count > 0 || unassigned.last_migration) ? (
+              <div className="card-soft" style={{ marginBottom: 12 }}>
+                <b>归属待定项目（{unassigned.count || 0}）</b>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  这些历史项目拿不到唯一组织归属，组织级成员不可见；指定归属后才会恢复访问。
+                  {unassigned.last_migration ? ` 最近一次回填：扫描 ${unassigned.last_migration.scanned}、回填 ${unassigned.last_migration.resolved}、待定 ${unassigned.last_migration.unresolved}。` : ''}
+                </div>
+                {(unassigned.projects || []).map((p: any) => (
+                  <div className="line" key={p.id} style={{ marginTop: 6 }}>
+                    <span>{p.name}</span>
+                    <span className="muted mono"> {p.owner_id || '无 owner'}</span>
+                    <button className="btn primary" style={{ marginLeft: 8 }} onClick={async () => {
+                      const oid = prompt('指定归属组织 ID（如 org_default）')
+                      if (!oid) return
+                      try { await api.assignProjectOrg(p.id, oid, '后台人工指定'); refresh() }
+                      catch (e: any) { alert('指定失败：' + (e?.message || e)) }
+                    }}>指定归属</button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <table className="admin-table">
             <thead><tr><th>名称</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody>
               {projects.map((p) => (
@@ -99,7 +131,8 @@ export default function Admin({ onBack }: { onBack: () => void }) {
                 </tr>
               ))}
             </tbody>
-          </table>
+            </table>
+          </div>
         )}
 
         {tab === 'runs' && (

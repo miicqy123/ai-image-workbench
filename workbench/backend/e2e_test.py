@@ -1,17 +1,45 @@
-"""端到端验证脚本：覆盖 PRD 验收用例 1-7 的后端链路。"""
-import io, json, time, urllib.request, urllib.error
+"""端到端验证脚本：覆盖 PRD 验收用例 1-7 的后端链路。
+
+第 1 批起后端要求真实会话、第 2 批起要求同源（CSRF），因此脚本会先登录，
+并在所有请求上带同源 Origin。
+
+用法（在 workbench/backend 目录下）：
+    set WB_E2E_USER=usr_default
+    set WB_E2E_PASSWORD=<该账号密码>
+    python e2e_test.py
+"""
+import http.cookiejar
+import io, json, os, time, urllib.request, urllib.error
 from PIL import Image, ImageDraw
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("WB_E2E_BASE", "http://127.0.0.1:8000")
+USER_ID = os.environ.get("WB_E2E_USER", "usr_default")
+PASSWORD = os.environ.get("WB_E2E_PASSWORD", "")
+
+_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_jar))
+
+
+def login():
+    """建立服务端会话；缺少密码时直接退出，避免把未认证的失败误判为功能回归。"""
+    if not PASSWORD:
+        print("缺少 WB_E2E_PASSWORD 环境变量（该账号的密码）")
+        raise SystemExit(2)
+    st, txt = req("POST", "/api/auth/login", {"user_id": USER_ID, "password": PASSWORD})
+    if st != 200:
+        print("登录失败：", st, txt)
+        raise SystemExit(2)
+    print(f"[0] 已登录：{USER_ID}")
+
 
 def req(method, path, body=None):
     url = BASE + path
-    data = None; h = {}
+    data = None; h = {"Origin": BASE}
     if body is not None:
         data = json.dumps(body).encode(); h["Content-Type"] = "application/json"
     r = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
+        with _opener.open(r, timeout=30) as resp:
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
@@ -29,9 +57,11 @@ def multipart(path, field, filename, data_bytes, ctype, extra_fields=None):
 
 def _raw(path, body, boundary):
     url = BASE + path
-    r = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
+    r = urllib.request.Request(url, data=body,
+                              headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Origin": BASE},
+                              method="POST")
     try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
+        with _opener.open(r, timeout=30) as resp:
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
@@ -44,6 +74,8 @@ def poll_run(rid, timeout=40):
             return d
         time.sleep(0.25)
     return {"status": "timeout"}
+
+login()
 
 # 1) 建项目
 st, txt = req("POST", "/api/projects", {"name": "E2E测试·营销主图"})
