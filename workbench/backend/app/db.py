@@ -134,6 +134,27 @@ CREATE TABLE IF NOT EXISTS prompt_templates (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT, template_text TEXT NOT NULL,
     model_hint TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS organizations (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, plan TEXT DEFAULT 'standard',
+    credit_balance REAL NOT NULL DEFAULT 0, quota_total REAL NOT NULL DEFAULT 0,
+    daily_limit REAL NOT NULL DEFAULT 0, period_start INTEGER, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage_records (
+    id TEXT PRIMARY KEY, tenant_id TEXT, organization_id TEXT, project_id TEXT, user_id TEXT,
+    job_id TEXT, run_id TEXT, model_id TEXT, task_type TEXT,
+    input_images INTEGER NOT NULL DEFAULT 0, output_images INTEGER NOT NULL DEFAULT 0,
+    width INTEGER, height INTEGER, resolution_tier TEXT, duration_ms INTEGER,
+    unit_cost REAL NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'succeeded', created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_records_created ON usage_records(created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_records_project ON usage_records(project_id);
+CREATE TABLE IF NOT EXISTS credit_ledger (
+    id TEXT PRIMARY KEY, organization_id TEXT, user_id TEXT, change REAL NOT NULL,
+    balance_after REAL NOT NULL, reason TEXT, operator_id TEXT,
+    ref_type TEXT, ref_id TEXT, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_org ON credit_ledger(organization_id);
 """
 
 
@@ -185,6 +206,14 @@ def init_db() -> None:
             if col not in mcols2:
                 conn.execute(f"ALTER TABLE model_registry ADD COLUMN {col} TEXT")
         conn.commit()
+        mcols3 = [r["name"] for r in conn.execute("PRAGMA table_info(model_registry)")]
+        if "unit_cost" not in mcols3:
+            conn.execute("ALTER TABLE model_registry ADD COLUMN unit_cost REAL NOT NULL DEFAULT 0")
+        conn.commit()
+        # 默认组织与初始额度（单机演示；生产应做真实计费与隔离）
+        conn.execute("INSERT OR IGNORE INTO organizations(id,name,plan,credit_balance,quota_total,daily_limit,period_start,created_at) "
+                     "VALUES(?,?,?,?,?,?,?,?)",
+                     ("org_default", "默认企业组织", "standard", 100000.0, 100000.0, 0.0, int(time.time()), int(time.time())))
         # 默认租户，便于单机演示（生产应做真实鉴权与隔离）
         conn.execute("INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)", ("tnt_default", "默认企业租户"))
         conn.execute("INSERT OR IGNORE INTO users(id,tenant_id,role) VALUES(?,?,?)", ("usr_default", "tnt_default", "admin"))

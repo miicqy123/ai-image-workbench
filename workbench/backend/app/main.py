@@ -25,6 +25,7 @@ from .generators import image as image_gen
 from .services import canvas_renderer
 from .services import model_router
 from .services import prompt_compiler
+from .services import metering
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -1057,6 +1058,9 @@ class RunReq(BaseModel):
 
 
 def _run_node_thread(run_id, node_id, model_id, params, ref_asset_ids, idem):
+    started = db.now()
+    proj = get_project_of_node(node_id)
+    ntype = (db.query_one("SELECT type FROM nodes WHERE id=?", (node_id,)) or {}).get("type") or ""
     try:
         db.execute("UPDATE node_runs SET status='running', started_at=? WHERE id=?", (db.now(), run_id))
         n = db.query_one("SELECT type,graph_id FROM nodes WHERE id=?", (node_id,))
@@ -1068,9 +1072,23 @@ def _run_node_thread(run_id, node_id, model_id, params, ref_asset_ids, idem):
             db.execute("INSERT INTO run_outputs(run_id,asset_id,output_json) VALUES(?,?,?)",
                        (run_id, out["asset_id"], json.dumps(out)))
         mark_stale(node_id)
+        if n["type"] in ("image_generation", "image_prompt", "strategy"):
+            outs = result.get("outputs", []) or []
+            w = outs[0]["width"] if outs else None
+            h = outs[0]["height"] if outs else None
+            metering.record_usage(project_id=proj, model_id=model_id, task_type=n["type"],
+                                  output_images=len(outs), width=w, height=h,
+                                  duration_ms=int((db.now() - started) * 1000),
+                                  status="succeeded", run_id=run_id)
     except Exception as e:
         db.execute("UPDATE node_runs SET status='failed', ended_at=?, error_code=? WHERE id=?",
                    (db.now(), str(e)[:200], run_id))
+        try:
+            metering.record_usage(project_id=proj, model_id=model_id, task_type=ntype,
+                                  output_images=0, duration_ms=int((db.now() - started) * 1000),
+                                  status="failed", run_id=run_id)
+        except Exception:
+            pass
 
 
 def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version, run_id=None):
@@ -1659,6 +1677,8 @@ def admin_stats():
         "providers": cnt("SELECT count(*) c FROM providers"),
         "runs": cnt("SELECT count(*) c FROM node_runs"),
         "audits": cnt("SELECT count(*) c FROM audit_events"),
+        "usage_calls": cnt("SELECT count(*) c FROM usage_records"),
+        "total_cost": round(float((db.query_one("SELECT COALESCE(SUM(cost),0) c FROM usage_records") or {"c": 0})["c"] or 0), 4),
     }
 
 
@@ -1688,6 +1708,209 @@ def list_runs():
 @app.get("/api/audit")
 def list_audit():
     return db.query("SELECT * FROM audit_events ORDER BY time DESC LIMIT 100")
+
+
+# ---------------- 额度、成本与账单（模块 K 后台 / 模块 I 前台额度） ----------------
+class QuotaIn(BaseModel):
+    plan: Optional[str] = None
+    quota_total: Optional[float] = None
+    daily_limit: Optional[float] = None
+    credit_balance: Optional[float] = None
+
+
+class CreditIn(BaseModel):
+    organization_id: Optional[str] = None
+    user_id: Optional[str] = None
+    amount: float
+    reason: str = ""
+
+
+class PricingIn(BaseModel):
+    unit_cost: float
+
+
+def _usage_filter(project_id=None, model_id=None, task_type=None, status=None, days=None, org_id=None):
+    sql = "SELECT * FROM usage_records WHERE 1=1"
+    args = []
+    if project_id:
+        sql += " AND project_id=?"; args.append(project_id)
+    if model_id:
+        sql += " AND model_id=?"; args.append(model_id)
+    if task_type:
+        sql += " AND task_type=?"; args.append(task_type)
+    if status:
+        sql += " AND status=?"; args.append(status)
+    if org_id:
+        sql += " AND organization_id=?"; args.append(org_id)
+    if days:
+        sql += " AND created_at>=?"; args.append(int(db.now()) - int(days) * 86400)
+    return sql, args
+
+
+@app.get("/api/admin/usage-records")
+def admin_usage_records(project_id: Optional[str] = None, model_id: Optional[str] = None,
+                        task_type: Optional[str] = None, status: Optional[str] = None,
+                        days: Optional[int] = None, limit: int = 200):
+    sql, args = _usage_filter(project_id, model_id, task_type, status, days)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    return db.query(sql, tuple(args) + (int(limit),))
+
+
+@app.get("/api/admin/cost-summary")
+def admin_cost_summary(days: int = 30):
+    since = int(db.now()) - int(days) * 86400
+    rows = db.query("SELECT * FROM usage_records WHERE created_at>=?", (since,))
+    total_cost = round(sum(float(r["cost"] or 0) for r in rows), 4)
+    succeeded = [r for r in rows if r["status"] == "succeeded"]
+    failed = [r for r in rows if r["status"] != "succeeded"]
+    by_model: dict = {}
+    by_task: dict = {}
+    by_day: dict = {}
+    for r in rows:
+        k = r["model_id"] or "unknown"
+        m = by_model.setdefault(k, {"model_id": k, "calls": 0, "cost": 0.0, "images": 0, "failed": 0})
+        m["calls"] += 1; m["cost"] = round(m["cost"] + float(r["cost"] or 0), 4)
+        m["images"] += int(r["output_images"] or 0)
+        if r["status"] != "succeeded":
+            m["failed"] += 1
+        t = by_task.setdefault(r["task_type"] or "unknown", {"task_type": r["task_type"] or "unknown", "calls": 0, "cost": 0.0})
+        t["calls"] += 1; t["cost"] = round(t["cost"] + float(r["cost"] or 0), 4)
+        import time as _t
+        d = _t.strftime("%Y-%m-%d", _t.localtime(r["created_at"]))
+        dd = by_day.setdefault(d, {"date": d, "calls": 0, "cost": 0.0, "images": 0})
+        dd["calls"] += 1; dd["cost"] = round(dd["cost"] + float(r["cost"] or 0), 4)
+        dd["images"] += int(r["output_images"] or 0)
+    return {
+        "days": days,
+        "calls": len(rows), "succeeded": len(succeeded), "failed": len(failed),
+        "total_cost": total_cost,
+        "failed_cost": 0.0,
+        "images": sum(int(r["output_images"] or 0) for r in rows),
+        "avg_cost": round(total_cost / len(succeeded), 4) if succeeded else 0.0,
+        "by_model": sorted(by_model.values(), key=lambda x: -x["cost"]),
+        "by_task": sorted(by_task.values(), key=lambda x: -x["cost"]),
+        "by_day": sorted(by_day.values(), key=lambda x: x["date"]),
+    }
+
+
+@app.get("/api/admin/organizations")
+def admin_organizations():
+    return db.query("SELECT * FROM organizations ORDER BY created_at ASC")
+
+
+@app.get("/api/admin/organizations/{oid}/quota")
+def admin_org_quota(oid: str):
+    o = db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
+    if not o:
+        raise HTTPException(404, "组织不存在")
+    used = db.query_one("SELECT COALESCE(SUM(cost),0) c FROM usage_records WHERE organization_id=? AND status='succeeded' AND created_at>=?",
+                        (oid, int(o["period_start"] or 0)))["c"]
+    return {**o, "used_this_period": round(float(used or 0), 4),
+            "remaining": round(float(o["credit_balance"] or 0), 4)}
+
+
+@app.put("/api/admin/organizations/{oid}/quota")
+def admin_update_org_quota(oid: str, body: QuotaIn):
+    o = db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
+    if not o:
+        raise HTTPException(404, "组织不存在")
+    fields, args = [], []
+    for col in ("plan", "quota_total", "daily_limit", "credit_balance"):
+        v = getattr(body, col)
+        if v is not None:
+            fields.append(f"{col}=?"); args.append(v)
+    if not fields:
+        return o
+    db.execute(f"UPDATE organizations SET {','.join(fields)} WHERE id=?", tuple(args) + (oid,))
+    db.audit(None, "usr_default", "org.quota.update", oid)
+    return db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
+
+
+@app.get("/api/admin/credit-ledger")
+def admin_credit_ledger(limit: int = 200):
+    return db.query("SELECT * FROM credit_ledger ORDER BY created_at DESC LIMIT ?", (int(limit),))
+
+
+@app.post("/api/admin/credits/grant", status_code=201)
+def admin_credits_grant(body: CreditIn):
+    if body.amount <= 0:
+        raise HTTPException(422, "补发额度必须为正数")
+    r = metering.apply_credit_change(body.organization_id, abs(body.amount),
+                                     body.reason or "人工补发额度", operator_id="usr_default",
+                                     ref_type="manual", ref_id="", user_id=body.user_id)
+    if not r:
+        raise HTTPException(404, "组织不存在")
+    db.audit(None, "usr_default", "credits.grant", r["id"])
+    return r
+
+
+@app.post("/api/admin/credits/deduct", status_code=201)
+def admin_credits_deduct(body: CreditIn):
+    if body.amount <= 0:
+        raise HTTPException(422, "扣除额度必须为正数")
+    r = metering.apply_credit_change(body.organization_id, -abs(body.amount),
+                                     body.reason or "人工扣除额度", operator_id="usr_default",
+                                     ref_type="manual", ref_id="", user_id=body.user_id)
+    if not r:
+        raise HTTPException(404, "组织不存在")
+    db.audit(None, "usr_default", "credits.deduct", r["id"])
+    return r
+
+
+@app.post("/api/admin/credits/refund", status_code=201)
+def admin_credits_refund(body: CreditIn):
+    if body.amount <= 0:
+        raise HTTPException(422, "退款额度必须为正数")
+    r = metering.apply_credit_change(body.organization_id, abs(body.amount),
+                                     body.reason or "失败任务返还额度", operator_id="usr_default",
+                                     ref_type="refund", ref_id="", user_id=body.user_id)
+    if not r:
+        raise HTTPException(404, "组织不存在")
+    db.audit(None, "usr_default", "credits.refund", r["id"])
+    return r
+
+
+@app.put("/api/admin/models/{model_id}/pricing")
+def admin_model_pricing(model_id: str, body: PricingIn):
+    m = db.query_one("SELECT model_id FROM model_registry WHERE model_id=?", (model_id,))
+    if not m:
+        raise HTTPException(404, "模型不存在")
+    db.execute("UPDATE model_registry SET unit_cost=? WHERE model_id=?", (float(body.unit_cost), model_id))
+    db.audit(None, "usr_default", "model.pricing.update", model_id)
+    return db.query_one("SELECT * FROM model_registry WHERE model_id=?", (model_id,))
+
+
+@app.get("/api/creator/usage-summary")
+def creator_usage_summary(days: int = 30):
+    o = metering.get_org(None) or {}
+    since = int(db.now()) - int(days) * 86400
+    rows = db.query("SELECT * FROM usage_records WHERE created_at>=?", (since,))
+    this_month = [r for r in rows if r["created_at"] >= int(o.get("period_start") or 0)]
+    by_model: dict = {}
+    for r in rows:
+        k = r["model_id"] or "unknown"
+        m = by_model.setdefault(k, {"model_id": k, "calls": 0, "cost": 0.0, "images": 0})
+        m["calls"] += 1; m["cost"] = round(m["cost"] + float(r["cost"] or 0), 4)
+        m["images"] += int(r["output_images"] or 0)
+    return {
+        "organization": {"id": o.get("id"), "name": o.get("name"), "plan": o.get("plan")},
+        "balance": round(float(o.get("credit_balance") or 0), 4),
+        "quota_total": round(float(o.get("quota_total") or 0), 4),
+        "used_this_month": round(sum(float(r["cost"] or 0) for r in this_month), 4),
+        "calls_this_month": len(this_month),
+        "images_this_month": sum(int(r["output_images"] or 0) for r in this_month),
+        "window_days": days,
+        "window_cost": round(sum(float(r["cost"] or 0) for r in rows), 4),
+        "by_model": sorted(by_model.values(), key=lambda x: -x["cost"]),
+    }
+
+
+@app.get("/api/creator/usage-records")
+def creator_usage_records(days: int = 30, limit: int = 100):
+    since = int(db.now()) - int(days) * 86400
+    return db.query("SELECT id,project_id,model_id,task_type,output_images,cost,status,created_at "
+                    "FROM usage_records WHERE created_at>=? ORDER BY created_at DESC LIMIT ?",
+                    (since, int(limit)))
 
 
 if _os.path.isdir(_DIST):

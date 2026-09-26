@@ -6,7 +6,9 @@ const L: Record<string, string> = { draft: '草稿', generating: '生成中', co
 
 export default function HomePage({ onQuickCreate, onProjects }: { onQuickCreate: () => void; onProjects: () => void }) {
   const [d, setD] = useState<any>(null)
+  const [u, setU] = useState<any>(null)
   useEffect(() => { api.creatorDashboard().then(setD).catch(() => setD(null)) }, [])
+  useEffect(() => { api.creatorUsageSummary().then(setU).catch(() => setU(null)) }, [])
   return (
     <div className="page">
       <header className="page-head"><h1>我的工作台</h1><button className="btn primary" onClick={onQuickCreate}>+ 新建创作</button></header>
@@ -15,6 +17,14 @@ export default function HomePage({ onQuickCreate, onProjects }: { onQuickCreate:
         {['draft', 'generating', 'completed', 'archived'].map((s) => (
           <div className="stat-card" key={s}><div className="stat-num">{d?.by_status?.[s] || 0}</div><div className="stat-label">{L[s]}</div></div>
         ))}
+      </div>
+      <h2 className="page-sub">额度与用量</h2>
+      <div className="stat-row">
+        <div className="stat-card"><div className="stat-num">{u?.balance ?? '—'}</div><div className="stat-label">剩余额度</div></div>
+        <div className="stat-card"><div className="stat-num">{u?.quota_total ?? '—'}</div><div className="stat-label">总额度</div></div>
+        <div className="stat-card"><div className="stat-num">{u?.used_this_month ?? '—'}</div><div className="stat-label">本月消耗</div></div>
+        <div className="stat-card"><div className="stat-num">{u?.calls_this_month ?? 0}</div><div className="stat-label">本月调用</div></div>
+        <div className="stat-card"><div className="stat-num">{u?.images_this_month ?? 0}</div><div className="stat-label">本月出图</div></div>
       </div>
       <h2 className="page-sub">快速创建</h2>
       <div className="quick-grid">{QUICK.map((q) => <button key={q} className="quick-card" onClick={onQuickCreate}>{q}</button>)}</div>

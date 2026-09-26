@@ -6,6 +6,7 @@ import json
 import time
 from .. import db, registry, storage
 from ..generators import image as image_gen
+from ..services import metering
 
 
 def _claim_one():
@@ -57,20 +58,36 @@ def _run_job(job):
                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                    (db.gen_id("cand"), brief["project_id"], job["id"], job.get("prompt_version_id"), aid, model_id,
                     job.get("provider_id"), o["width"], o["height"], "ready", 0, "{}", int(db.now())))
-    return len(outputs)
+    return {"count": len(outputs),
+            "width": outputs[0]["width"] if outputs else None,
+            "height": outputs[0]["height"] if outputs else None,
+            "input_images": len(pil_imgs)}
 
 
 def run_once():
     job = _claim_one()
     if not job:
         return False
+    started = job.get("started_at") or db.now()
     try:
-        _run_job(job)
+        info = _run_job(job)
         db.execute("UPDATE generation_jobs SET status='succeeded', progress=100, finished_at=? WHERE id=?",
                    (int(db.now()), job["id"]))
+        metering.record_usage(project_id=job["project_id"], model_id=job["model_id"],
+                              task_type=job["task_type"], output_images=info["count"],
+                              input_images=info["input_images"], width=info["width"], height=info["height"],
+                              duration_ms=int((db.now() - started) * 1000),
+                              status="succeeded", job_id=job["id"], user_id=job.get("user_id") or "usr_default")
     except Exception as e:
         db.execute("UPDATE generation_jobs SET status='failed', error_code=?, error_message=?, finished_at=? WHERE id=?",
                    (type(e).__name__, str(e)[:300], int(db.now()), job["id"]))
+        try:
+            metering.record_usage(project_id=job["project_id"], model_id=job["model_id"],
+                                  task_type=job["task_type"], output_images=0,
+                                  duration_ms=int((db.now() - started) * 1000),
+                                  status="failed", job_id=job["id"], user_id=job.get("user_id") or "usr_default")
+        except Exception:
+            pass
     return True
 
 
