@@ -42,6 +42,7 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([])
   const [generatedAssets, setGeneratedAssets] = useState<string[]>([])
   const [projectId, setProjectId] = useState('')
+  const [candidates, setCandidates] = useState<any[]>([])
   const [workflow, setWorkflow] = useState<{ stages: { id: string; label: string; status: string }[]; current: number } | null>(null)
   const boardRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<Drag | null>(null)
@@ -166,12 +167,9 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
     setWorkflow({ stages: WORKFLOW_STAGES.map((s, i) => ({ id: 's' + i, label: s, status: i === 0 ? 'active' : 'pending' })), current: 0 })
     const mark = (idx: number) => setWorkflow((w) => w ? { ...w, current: idx, stages: w.stages.map((s, i) => ({ ...s, status: i < idx ? 'done' : i === idx ? 'active' : 'pending' })) } : w)
     try {
-      // 建项目 + 初始化对应工作流骨架
       const p = await api.createProject(template.name + (opts.platform ? ' · ' + opts.platform : ''))
       setProjectId(p.id)
       await api.initTemplate(p.id, template.skeleton || 'poster')
-      const g = await api.getGraph(p.id)
-      // 上传产品图并挂载到产品图节点
       let uploaded: string[] = []
       for (const f of uploadedFiles) {
         const a = await api.uploadAsset(p.id, f, 'product')
@@ -180,35 +178,24 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
       await api.upsertGenerationBrief(p.id, {
         user_prompt: opts.prompt, purpose: 'marketing_poster', platform: opts.platform,
         aspect_ratio: opts.ratio, image_count: opts.count, selected_model_id: opts.model_id || null,
-        reference_asset_ids: [], product_asset_ids: uploaded, style_keywords: [], brand_keywords: [],
+        product_asset_ids: uploaded, reference_asset_ids: [],
       })
-      const imgNode = g.nodes.find((n) => n.type === 'product_image')
-      if (imgNode && uploaded.length) {
-        await api.patchNode(imgNode.id, { content: { asset_id: uploaded[0], reference_asset_ids: uploaded, asset_role: 'product', filename: 'product' } })
-      }
-      const byType = (t: string) => g.nodes.filter((n) => n.type === t).map((n) => n.id)
-      const strat = byType('strategy')[0]
-      const prompts = byType('image_prompt')
-      const gens = byType('image_generation')
-      // 逐环节运行
-      mark(2)
-      if (strat) await runAndWait(strat)
       mark(3)
-      for (const pid2 of prompts) await runAndWait(pid2)
+      const job = await api.createJob(p.id, { model_id: opts.model_id || undefined, task_type: uploaded.length ? 'product_composition' : 'text_to_image' })
       mark(4)
-      for (const gid of gens) await runAndWait(gid, { count: Math.min(opts.count || 1, 4), aspect_ratio: opts.ratio || '1:1' }, opts.model_id)
+      let st = 'queued'
+      for (let i = 0; i < 240; i++) {
+        await sleep(500)
+        const j = await api.getJob(job.id)
+        st = j.status
+        if (st === 'succeeded' || st === 'failed' || st === 'canceled') break
+      }
+      if (st === 'failed') throw new Error('生成任务失败（请检查模型/服务商配置，或确认 worker 已启动）')
+      if (st !== 'succeeded') throw new Error('生成任务超时（请确认生图 worker 正在运行）')
       mark(6)
-      // 收集真实产出
-      const g2 = await api.getGraph(p.id)
-      const outs: string[] = []
-      g2.nodes.forEach((n) => { if (n.type === 'image_generation') outs.push(...(n.content?.outputs || [])) })
-      setGeneratedAssets(outs)
-      const cols = 3
-      outs.forEach((aid, i) => {
-        const col = i % cols, row = Math.floor(i / cols)
-        add({ id: nid(), type: 'image', imageUrl: fileUrl(aid), x: size.w / 2 - 170 + col * 125, y: size.h / 2 - 80 + row * 125, w: 118, h: 118 })
-      })
-      notify(outs.length ? `已真实产出 ${outs.length} 张图` : '工作流已跑通，但未产出图片（可在模型/服务商管理接入真实生图模型）')
+      const cands = await api.listCandidates(p.id)
+      setCandidates(cands)
+      notify(cands.length ? `已生成 ${cands.length} 张候选图` : '未产出候选图')
     } catch (e: any) {
       notify('运行失败：' + (e?.message || e))
     } finally {
@@ -254,6 +241,21 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
           <button className="btn primary" onClick={runNext} disabled={workflow.current >= workflow.stages.length - 1}>运行下一步</button>
         </div>
       )}
+      {candidates.length > 0 && (
+        <div className="cand-bar">
+          <span className="cand-bar-title">候选图 {candidates.length}</span>
+          {candidates.map((c) => (
+            <div key={c.id} className={`cand-item ${c.is_selected ? 'on' : ''}`}>
+              <img src={fileUrl(c.asset_id)} alt="" />
+              <div className="cand-actions">
+                <button className="btn" onClick={async () => { await api.selectCandidate(c.id); setCandidates(await api.listCandidates(projectId)) }}>{c.is_selected ? '已选主图' : '设为主图'}</button>
+                <button className="btn primary" onClick={() => add({ id: nid(), type: 'image', imageUrl: fileUrl(c.asset_id), x: size.w / 2 - 120, y: size.h / 2 - 120, w: 240, h: 240 })}>进入画布</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="design-body">
         <Toolbar
           active={active}

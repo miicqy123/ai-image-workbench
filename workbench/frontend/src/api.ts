@@ -87,6 +87,12 @@ export const api = {
   exportPackage: (pid: string) => `${BASE}/api/projects/${pid}/export-package`,
 
   getDefaults: (pid: string) => fetch(`${BASE}/api/projects/${pid}/defaults`).then(j<any>),
+  createJob: (pid: string, body: any) =>
+    fetch(`${BASE}/api/projects/${pid}/generation-jobs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  getJob: (jid: string) => fetch(`${BASE}/api/generation-jobs/${jid}`).then(j<any>),
+  listCandidates: (pid: string) => fetch(`${BASE}/api/projects/${pid}/candidates`).then(j<any[]>),
+  selectCandidate: (cid: string) => fetch(`${BASE}/api/candidates/${cid}/select`, { method: 'POST' }).then(j<any>),
+
   getCanvas: (pid: string) => fetch(`${BASE}/api/projects/${pid}/canvas`).then(j<any>),
   putCanvas: (pid: string, body: any) =>
     fetch(`${BASE}/api/projects/${pid}/canvas`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
