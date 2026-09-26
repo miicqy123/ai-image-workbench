@@ -170,6 +170,17 @@ CREATE TABLE IF NOT EXISTS notifications (
     ref_type TEXT, ref_id TEXT, read INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, name TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memberships (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, organization_id TEXT NOT NULL,
+    workspace_id TEXT, role TEXT NOT NULL DEFAULT 'editor', status TEXT NOT NULL DEFAULT 'active',
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(organization_id);
+CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id);
 """
 
 
@@ -227,6 +238,12 @@ def init_db() -> None:
         if "unit_cost" not in mcols3:
             conn.execute("ALTER TABLE model_registry ADD COLUMN unit_cost REAL NOT NULL DEFAULT 0")
         conn.commit()
+        ucols = [r["name"] for r in conn.execute("PRAGMA table_info(users)")]
+        for col, ctype in [("name", "TEXT"), ("email", "TEXT"), ("status", "TEXT DEFAULT 'active'"),
+                           ("organization_id", "TEXT"), ("created_at", "INTEGER")]:
+            if col not in ucols:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ctype}")
+        conn.commit()
         tcols = [r["name"] for r in conn.execute("PRAGMA table_info(templates)")]
         if "require_review" not in tcols:
             conn.execute("ALTER TABLE templates ADD COLUMN require_review INTEGER NOT NULL DEFAULT 0")
@@ -237,7 +254,17 @@ def init_db() -> None:
                      ("org_default", "默认企业组织", "standard", 100000.0, 100000.0, 0.0, int(time.time()), int(time.time())))
         # 默认租户，便于单机演示（生产应做真实鉴权与隔离）
         conn.execute("INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)", ("tnt_default", "默认企业租户"))
-        conn.execute("INSERT OR IGNORE INTO users(id,tenant_id,role) VALUES(?,?,?)", ("usr_default", "tnt_default", "admin"))
+        conn.execute("INSERT OR IGNORE INTO users(id,tenant_id,role,name,email,status,organization_id,created_at) "
+                     "VALUES(?,?,?,?,?,?,?,?)",
+                     ("usr_default", "tnt_default", "super_admin", "默认管理员", "admin@example.com", "active",
+                      "org_default", int(time.time())))
+        conn.execute("INSERT OR IGNORE INTO memberships(id,user_id,organization_id,role,status,created_at,updated_at) "
+                     "VALUES(?,?,?,?,?,?,?)",
+                     ("mem_default", "usr_default", "org_default", "super_admin", "active",
+                      int(time.time()), int(time.time())))
+        conn.execute("INSERT OR IGNORE INTO workspaces(id,organization_id,name,created_at) VALUES(?,?,?,?)",
+                     ("wsp_default", "org_default", "默认工作空间", int(time.time())))
+        conn.commit()
         conn.commit()
         conn.close()
 

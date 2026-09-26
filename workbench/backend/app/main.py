@@ -12,7 +12,7 @@ import time
 import zipfile
 from collections import defaultdict, deque
 from PIL import Image, ImageDraw
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from pydantic import BaseModel
@@ -28,6 +28,7 @@ from .services import prompt_compiler
 from .services import metering
 from .services import compliance
 from .services import notify as notify_svc
+from .services import rbac
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -1852,7 +1853,7 @@ def admin_org_quota(oid: str):
 
 
 @app.put("/api/admin/organizations/{oid}/quota")
-def admin_update_org_quota(oid: str, body: QuotaIn):
+def admin_update_org_quota(oid: str, body: QuotaIn, _role: str = Depends(rbac.require_permission("org.quota.manage"))):
     o = db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
     if not o:
         raise HTTPException(404, "组织不存在")
@@ -1874,7 +1875,7 @@ def admin_credit_ledger(limit: int = 200):
 
 
 @app.post("/api/admin/credits/grant", status_code=201)
-def admin_credits_grant(body: CreditIn):
+def admin_credits_grant(body: CreditIn, _role: str = Depends(rbac.require_permission('org.quota.manage'))):
     if body.amount <= 0:
         raise HTTPException(422, "补发额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, abs(body.amount),
@@ -1887,7 +1888,7 @@ def admin_credits_grant(body: CreditIn):
 
 
 @app.post("/api/admin/credits/deduct", status_code=201)
-def admin_credits_deduct(body: CreditIn):
+def admin_credits_deduct(body: CreditIn, _role: str = Depends(rbac.require_permission('org.quota.manage'))):
     if body.amount <= 0:
         raise HTTPException(422, "扣除额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, -abs(body.amount),
@@ -1900,7 +1901,7 @@ def admin_credits_deduct(body: CreditIn):
 
 
 @app.post("/api/admin/credits/refund", status_code=201)
-def admin_credits_refund(body: CreditIn):
+def admin_credits_refund(body: CreditIn, _role: str = Depends(rbac.require_permission('org.quota.manage'))):
     if body.amount <= 0:
         raise HTTPException(422, "退款额度必须为正数")
     r = metering.apply_credit_change(body.organization_id, abs(body.amount),
@@ -2119,18 +2120,204 @@ def review_claim(rid: str, body: ReviewDecisionIn):
 
 
 @app.post("/api/admin/reviews/{rid}/approve")
-def review_approve(rid: str, body: ReviewDecisionIn):
+def review_approve(rid: str, body: ReviewDecisionIn, _role: str = Depends(rbac.require_permission("review.decide"))):
     return _decide_review(rid, "approved", body.reason, body.assigned_to)
 
 
 @app.post("/api/admin/reviews/{rid}/return")
-def review_return(rid: str, body: ReviewDecisionIn):
+def review_return(rid: str, body: ReviewDecisionIn, _role: str = Depends(rbac.require_permission("review.decide"))):
     return _decide_review(rid, "returned", body.reason, body.assigned_to)
 
 
 @app.post("/api/admin/reviews/{rid}/reject")
-def review_reject(rid: str, body: ReviewDecisionIn):
+def review_reject(rid: str, body: ReviewDecisionIn, _role: str = Depends(rbac.require_permission("review.decide"))):
     return _decide_review(rid, "rejected", body.reason, body.assigned_to)
+
+
+# ---------------- 用户、组织与权限（模块 B 后台） ----------------
+class OrganizationIn(BaseModel):
+    id: Optional[str] = None
+    name: str
+    plan: str = "standard"
+    quota_total: float = 0
+    daily_limit: float = 0
+
+
+class WorkspaceIn(BaseModel):
+    id: Optional[str] = None
+    name: str
+
+
+class MemberIn(BaseModel):
+    user_id: Optional[str] = None
+    name: str = ""
+    email: str = ""
+    role: str = "editor"
+    workspace_id: Optional[str] = None
+
+
+class RoleAssignIn(BaseModel):
+    role: str
+
+
+@app.get("/api/admin/roles")
+def admin_roles():
+    return {"roles": rbac.roles(), "permissions": rbac.PERMISSIONS}
+
+
+@app.get("/api/admin/permissions")
+def admin_permissions():
+    return rbac.PERMISSIONS
+
+
+@app.post("/api/admin/organizations", status_code=201)
+def admin_create_organization(body: OrganizationIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+    oid = body.id or db.gen_id("org")
+    if db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
+        raise HTTPException(400, "组织 ID 已存在")
+    now = int(db.now())
+    db.execute("INSERT INTO organizations(id,name,plan,credit_balance,quota_total,daily_limit,period_start,created_at) "
+               "VALUES(?,?,?,?,?,?,?,?)",
+               (oid, body.name, body.plan, float(body.quota_total), float(body.quota_total),
+                float(body.daily_limit), now, now))
+    db.execute("INSERT OR IGNORE INTO workspaces(id,organization_id,name,created_at) VALUES(?,?,?,?)",
+               (db.gen_id("wsp"), oid, body.name + " 默认工作空间", now))
+    db.audit(None, "usr_default", "org.create", oid)
+    return db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
+
+
+@app.put("/api/admin/organizations/{oid}")
+def admin_update_organization(oid: str, body: OrganizationIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+    if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
+        raise HTTPException(404, "组织不存在")
+    db.execute("UPDATE organizations SET name=?, plan=? WHERE id=?", (body.name, body.plan, oid))
+    db.audit(None, "usr_default", "org.update", oid)
+    return db.query_one("SELECT * FROM organizations WHERE id=?", (oid,))
+
+
+@app.get("/api/admin/workspaces")
+def admin_workspaces(organization_id: Optional[str] = None):
+    sql, args = "SELECT * FROM workspaces WHERE 1=1", []
+    if organization_id:
+        sql += " AND organization_id=?"; args.append(organization_id)
+    return db.query(sql + " ORDER BY created_at ASC", tuple(args))
+
+
+@app.post("/api/admin/organizations/{oid}/workspaces", status_code=201)
+def admin_create_workspace(oid: str, body: WorkspaceIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+    if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
+        raise HTTPException(404, "组织不存在")
+    wid = body.id or db.gen_id("wsp")
+    db.execute("INSERT INTO workspaces(id,organization_id,name,created_at) VALUES(?,?,?,?)",
+               (wid, oid, body.name, int(db.now())))
+    return db.query_one("SELECT * FROM workspaces WHERE id=?", (wid,))
+
+
+def _member_rows() -> list:
+    users = db.query("SELECT * FROM users ORDER BY created_at ASC, id ASC")
+    usages = db.query("SELECT user_id, count(*) calls, COALESCE(SUM(cost),0) cost, COALESCE(SUM(output_images),0) images, "
+                      "COALESCE(SUM(duration_ms),0) ms FROM usage_records GROUP BY user_id")
+    umap = {u["user_id"]: u for u in usages}
+    out = []
+    for u in users:
+        ms = db.query("SELECT * FROM memberships WHERE user_id=?", (u["id"],))
+        m = ms[0] if ms else {}
+        usage = umap.get(u["id"], {})
+        org = db.query_one("SELECT name FROM organizations WHERE id=?", (m.get("organization_id") or u.get("organization_id"),))
+        out.append({
+            "user_id": u["id"], "name": u.get("name") or u["id"], "email": u.get("email") or "",
+            "status": u.get("status") or "active", "tenant_id": u.get("tenant_id"),
+            "membership_id": m.get("id"), "organization_id": m.get("organization_id") or u.get("organization_id"),
+            "organization_name": (org or {}).get("name") or "",
+            "workspace_id": m.get("workspace_id"),
+            "role": rbac.resolve_role(m.get("role") or u.get("role")),
+            "role_name": rbac.role_def(m.get("role") or u.get("role"))["name"],
+            "membership_status": m.get("status") or "active",
+            "calls": usage.get("calls", 0), "cost": round(float(usage.get("cost", 0) or 0), 4),
+            "images": usage.get("images", 0), "duration_ms": usage.get("ms", 0),
+        })
+    return out
+
+
+@app.get("/api/admin/users")
+def admin_users(_role: str = Depends(rbac.require_permission("member.manage"))):
+    return _member_rows()
+
+
+@app.get("/api/admin/users/{uid}/usage")
+def admin_user_usage(uid: str, days: int = 30):
+    since = int(db.now()) - int(days) * 86400
+    rows = db.query("SELECT * FROM usage_records WHERE user_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 200",
+                    (uid, since))
+    by_model: dict = {}
+    for r in rows:
+        k = r["model_id"] or "unknown"
+        m = by_model.setdefault(k, {"model_id": k, "calls": 0, "cost": 0.0, "images": 0})
+        m["calls"] += 1; m["cost"] = round(m["cost"] + float(r["cost"] or 0), 4)
+        m["images"] += int(r["output_images"] or 0)
+    return {"user_id": uid, "days": days, "calls": len(rows),
+            "cost": round(sum(float(r["cost"] or 0) for r in rows), 4),
+            "images": sum(int(r["output_images"] or 0) for r in rows),
+            "by_model": sorted(by_model.values(), key=lambda x: -x["cost"]), "records": rows[:100]}
+
+
+@app.post("/api/admin/organizations/{oid}/members", status_code=201)
+def admin_add_member(oid: str, body: MemberIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+    if not db.query_one("SELECT id FROM organizations WHERE id=?", (oid,)):
+        raise HTTPException(404, "组织不存在")
+    known_roles = {r["id"] for r in rbac.roles()} | {al for r in rbac.roles() for al in r["aliases"]}
+    if body.role not in known_roles:
+        raise HTTPException(422, f"未知角色 {body.role}")
+    uid = body.user_id or db.gen_id("usr")
+    now = int(db.now())
+    if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
+        db.execute("INSERT INTO users(id,tenant_id,role,name,email,status,organization_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                   (uid, "tnt_default", rbac.resolve_role(body.role), body.name or uid, body.email, "active", oid, now))
+    else:
+        db.execute("UPDATE users SET role=?, organization_id=? WHERE id=?", (rbac.resolve_role(body.role), oid, uid))
+    mid = db.gen_id("mem")
+    db.execute("INSERT INTO memberships(id,user_id,organization_id,workspace_id,role,status,created_at,updated_at) "
+               "VALUES(?,?,?,?,?,?,?,?)",
+               (mid, uid, oid, body.workspace_id, rbac.resolve_role(body.role), "active", now, now))
+    db.audit(None, "usr_default", "member.invite", uid)
+    notify_svc.notify(uid, "member", "你已被加入组织", f"角色：{rbac.role_def(body.role)['name']}", ref_type="org", ref_id=oid)
+    return {"membership_id": mid, "user_id": uid, "role": rbac.resolve_role(body.role)}
+
+
+@app.put("/api/admin/memberships/{mid}/role")
+def admin_set_member_role(mid: str, body: RoleAssignIn, _role: str = Depends(rbac.require_permission("member.manage"))):
+    m = db.query_one("SELECT * FROM memberships WHERE id=?", (mid,))
+    if not m:
+        raise HTTPException(404, "成员关系不存在")
+    known = {r["id"] for r in rbac.roles()} | {a for r in rbac.roles() for a in r["aliases"]}
+    if body.role not in known:
+        raise HTTPException(422, f"未知角色 {body.role}")
+    role = rbac.resolve_role(body.role)
+    db.execute("UPDATE memberships SET role=?, updated_at=? WHERE id=?", (role, int(db.now()), mid))
+    db.execute("UPDATE users SET role=? WHERE id=?", (role, m["user_id"]))
+    db.audit(None, "usr_default", "member.role.change", m["user_id"])
+    notify_svc.notify(m["user_id"], "member", f"你的角色已变更为 {rbac.role_def(role)['name']}", "", ref_type="membership", ref_id=mid)
+    return {"membership_id": mid, "user_id": m["user_id"], "role": role}
+
+
+@app.post("/api/admin/users/{uid}/disable")
+def admin_disable_user(uid: str, _role: str = Depends(rbac.require_permission("member.manage"))):
+    if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
+        raise HTTPException(404, "用户不存在")
+    db.execute("UPDATE users SET status='disabled' WHERE id=?", (uid,))
+    db.execute("UPDATE memberships SET status='disabled', updated_at=? WHERE user_id=?", (int(db.now()), uid))
+    db.audit(None, "usr_default", "member.disable", uid)
+    return {"user_id": uid, "status": "disabled"}
+
+
+@app.post("/api/admin/users/{uid}/enable")
+def admin_enable_user(uid: str, _role: str = Depends(rbac.require_permission("member.manage"))):
+    if not db.query_one("SELECT id FROM users WHERE id=?", (uid,)):
+        raise HTTPException(404, "用户不存在")
+    db.execute("UPDATE users SET status='active' WHERE id=?", (uid,))
+    db.execute("UPDATE memberships SET status='active', updated_at=? WHERE user_id=?", (int(db.now()), uid))
+    db.audit(None, "usr_default", "member.enable", uid)
+    return {"user_id": uid, "status": "active"}
 
 
 @app.get("/api/creator/notifications")

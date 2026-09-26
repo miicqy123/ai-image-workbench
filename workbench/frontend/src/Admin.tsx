@@ -16,6 +16,7 @@ const TABS = [
   { key: 'usage', label: '用量与成本' },
   { key: 'quota', label: '额度与组织' },
   { key: 'reviews', label: '审核中心' },
+  { key: 'users', label: '用户与权限' },
 ] as const
 
 export default function Admin({ onBack }: { onBack: () => void }) {
@@ -35,7 +36,10 @@ export default function Admin({ onBack }: { onBack: () => void }) {
   const [reviews, setReviews] = useState<any[]>([])
   const [reviewFilter, setReviewFilter] = useState('pending')
   const [reviewDetail, setReviewDetail] = useState<any>(null)
-  const [tab, setTab] = useState<'projects' | 'runs' | 'audit' | 'models' | 'assets' | 'templates' | 'prompts' | 'usage' | 'quota' | 'reviews'>('projects')
+  const [users, setUsers] = useState<any[]>([])
+  const [roleCat, setRoleCat] = useState<any>(null)
+  const [workspaces, setWorkspaces] = useState<any[]>([])
+  const [tab, setTab] = useState<'projects' | 'runs' | 'audit' | 'models' | 'assets' | 'templates' | 'prompts' | 'usage' | 'quota' | 'reviews' | 'users'>('projects')
   const [showModels, setShowModels] = useState(false)
 
   const refresh = async () => {
@@ -53,6 +57,9 @@ export default function Admin({ onBack }: { onBack: () => void }) {
     setOrgs(await api.adminOrganizations())
     setLedger(await api.adminCreditLedger())
     setReviews(await api.adminReviews(reviewFilter ? `?status=${reviewFilter}` : ''))
+    setUsers(await api.adminUsers())
+    setRoleCat(await api.adminRoles())
+    setWorkspaces(await api.adminWorkspaces())
   }
   useEffect(() => { refresh() }, [])
 
@@ -374,6 +381,90 @@ export default function Admin({ onBack }: { onBack: () => void }) {
                 <button className="btn" style={{ marginTop: 8 }} onClick={() => setReviewDetail(null)}>关闭详情</button>
               </div>
             )}
+          </div>
+        )}
+
+        {tab === 'users' && (
+          <div>
+            <div className="admin-models-head">
+              <h2>成员与权限（{users.length}）</h2>
+              <div>
+                <button className="btn" onClick={async () => {
+                  const name = prompt('组织名称')
+                  if (!name) return
+                  const total = prompt('组织总额度', '100000') || '0'
+                  await api.createOrganization({ name, quota_total: Number(total) })
+                  refresh()
+                }}>+ 新建组织</button>
+                <button className="btn primary" onClick={async () => {
+                  if (!orgs.length) { alert('请先创建组织'); return }
+                  const oid = orgs[0].id
+                  const name = prompt('成员名称')
+                  if (!name) return
+                  const email = prompt('邮箱', '') || ''
+                  const role = prompt(`角色（${(roleCat?.roles || []).map((r: any) => r.id).join(' / ')}）`, 'editor')
+                  if (!role) return
+                  try { await api.addMember(oid, { name, email, role }); refresh() }
+                  catch (e: any) { alert('邀请失败：' + (e?.message || e)) }
+                }}>+ 邀请成员</button>
+              </div>
+            </div>
+            <table className="admin-table">
+              <thead><tr><th>成员</th><th>邮箱</th><th>组织</th><th>角色</th><th>状态</th><th>用量</th><th>操作</th></tr></thead>
+              <tbody>
+                {users.map((u) => (
+                  <tr key={u.user_id}>
+                    <td>{u.name}<div className="muted mono">{u.user_id}</div></td>
+                    <td>{u.email || '—'}</td>
+                    <td>{u.organization_name || '—'}</td>
+                    <td>
+                      <select value={u.role} onChange={async (e) => {
+                        if (!u.membership_id) { alert('该用户没有成员关系，无法改角色'); return }
+                        try { await api.setMemberRole(u.membership_id, e.target.value); refresh() }
+                        catch (err: any) { alert('改角色失败：' + (err?.message || err)) }
+                      }}>
+                        {(roleCat?.roles || []).map((r: any) => <option key={r.id} value={r.id}>{r.name}</option>)}
+                      </select>
+                    </td>
+                    <td><span className={`run-tag ${u.status === 'active' ? 'run-succeeded' : 'run-failed'}`}>{u.status === 'active' ? '正常' : '已禁用'}</span></td>
+                    <td>{u.calls} 次 / {u.images} 图 / {u.cost} 点</td>
+                    <td>
+                      {u.status === 'active'
+                        ? <button className="btn danger" onClick={async () => { if (!confirm(`禁用成员「${u.name}」？`)) return; await api.disableUser(u.user_id); refresh() }}>禁用</button>
+                        : <button className="btn" onClick={async () => { await api.enableUser(u.user_id); refresh() }}>启用</button>}
+                    </td>
+                  </tr>
+                ))}
+                {!users.length && <tr><td colSpan={7} className="muted">还没有成员。</td></tr>}
+              </tbody>
+            </table>
+
+            <h2 style={{ marginTop: 16 }}>工作空间（{workspaces.length}）</h2>
+            <table className="admin-table">
+              <thead><tr><th>名称</th><th>组织</th><th>创建时间</th><th>操作</th></tr></thead>
+              <tbody>
+                {workspaces.map((w) => (
+                  <tr key={w.id}><td>{w.name}</td><td className="mono">{w.organization_id}</td>
+                    <td>{new Date(w.created_at * 1000).toLocaleString()}</td><td /></tr>
+                ))}
+                {!workspaces.length && <tr><td colSpan={4} className="muted">还没有工作空间。</td></tr>}
+              </tbody>
+            </table>
+
+            <h2 style={{ marginTop: 16 }}>角色与权限</h2>
+            <table className="admin-table">
+              <thead><tr><th>角色</th><th>可见区域</th><th>权限</th><th>历史别名</th></tr></thead>
+              <tbody>
+                {(roleCat?.roles || []).map((r: any) => (
+                  <tr key={r.id}>
+                    <td>{r.name}<div className="muted mono">{r.id}</div></td>
+                    <td>{r.areas.join(' / ')}</td>
+                    <td className="mono">{r.permission_list.length === (roleCat?.permissions || []).length ? '全部权限' : r.permission_list.join('、') || '只读'}</td>
+                    <td className="muted">{r.aliases.join('、') || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
 
