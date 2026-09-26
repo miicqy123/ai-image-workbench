@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { api, fileUrl } from './api'
 import { Asset, ModelInfo, WBNode } from './types'
 
@@ -37,6 +37,8 @@ export default function NodePanel({ node, pid, assets, models, defaultTextModel,
   const [layoutSub, setLayoutSub] = useState(c.subtitle || '')
   const [baseAsset, setBaseAsset] = useState('')
   const [genParams, setGenParams] = useState({ model_id: '', aspect_ratio: '1:1', resolution_tier: 'standard', count: 1, title: '', subtitle: '' })
+  const [tpls, setTpls] = useState<any[]>([])
+  useEffect(() => { api.listPromptTemplatesPublic().then(setTpls).catch(() => setTpls([])) }, [])
 
   if (node.type === 'product_facts') {
     return (
@@ -130,10 +132,18 @@ export default function NodePanel({ node, pid, assets, models, defaultTextModel,
     return (
       <div>
         <div className="section-title">单图提示词（strategy_ref: {c.strategy_ref}）</div>
+        <div className="field"><label>Prompt 模板（后台提示词库）</label>
+          <select value={c.prompt_template_id || ''} onChange={(e) => onPatch({ ...c, prompt_template_id: e.target.value })}>
+            <option value="">不使用模板（纯模型扩写）</option>
+            {tpls.map((t) => <option key={t.id} value={t.id}>{t.name}（{t.category}）</option>)}
+          </select>
+        </div>
+        {c.prompt_template_name ? <div className="hint">上次编译使用的模板：{c.prompt_template_name}</div> : null}
         <div className="field"><label>正向提示词</label><textarea value={c.prompt || ''} readOnly /></div>
         <div className="field"><label>负向提示词</label><textarea value={c.negative_prompt || ''} readOnly /></div>
         <button className="btn primary" onClick={() => onRun(node.id, defaultTextModel || 'rule-based-planner')}>生成 / 扩写提示词</button>
         <div className="hint">提示词只扩写当前策略，若需改卖点/场景类型请回到策略节点。</div>
+        <div className="hint">选择 Prompt 模板后，生成的提示词会按模板重新编译（platform / aspect_ratio / style_keywords 等变量取自项目 Brief）。</div>
       </div>
     )
   }

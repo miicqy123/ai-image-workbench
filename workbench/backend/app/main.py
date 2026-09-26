@@ -930,7 +930,7 @@ NODE_DEFAULTS = {
     "product_facts": {"product_id": "", "product_name": "", "activity_version": "", "confirmed_selling_points": [], "locked_appearance": [], "applicable_scenes": [], "forbidden_expressions": [], "policies": [], "recognition_notes": []},
     "product_image": {"asset_id": None, "asset_role": "product", "filename": ""},
     "strategy": {"strategies": [], "task_brief": {"goal": "", "channel": "", "audience": ""}},
-    "image_prompt": {"prompt": "", "negative_prompt": "", "strategy_ref": "hero_1"},
+    "image_prompt": {"prompt": "", "negative_prompt": "", "strategy_ref": "hero_1", "prompt_template_id": ""},
     "image_generation": {"model_id": "local-poster-compositor", "outputs": []},
     "review": {"conclusion": "", "issue_tags": []},
     "layout_export": {"title": "", "subtitle": "", "approved": False},
@@ -1092,7 +1092,8 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
         facts = get_upstream_facts(node_id)
         strat = get_upstream_strategy(node_id)
         baseline = (strat or {}).get("visual_baseline", {})
-        sref = get_current_version(node_id).get("strategy_ref", "hero_1")
+        cur_ver = get_current_version(node_id) or {}
+        sref = cur_ver.get("strategy_ref", "hero_1")
         item = next((s for s in strat.get("strategies", []) if s["id"] == sref), strat.get("strategies", [{}])[0] if strat.get("strategies") else {})
         prov = registry.resolve_provider(model_id or "rule-based-planner")
         if prov:
@@ -1102,8 +1103,26 @@ def execute_node(ntype, node_id, model_id, params, ref_asset_ids, graph_version,
                 prompt = text_gen.generate_prompt(item, facts, baseline=baseline)
         else:
             prompt = text_gen.generate_prompt(item, facts, baseline=baseline)
+        # Prompt 模板接入：命中的后台 Prompt 模板会把生成结果作为 {user_prompt} 重新编译
+        tpl_id = cur_ver.get("prompt_template_id") or params.get("prompt_template_id") or ""
+        used_tpl_id = ""
+        if tpl_id:
+            seed_prompt_templates()
+            tpl = db.query_one("SELECT * FROM prompt_templates WHERE id=? AND enabled=1", (tpl_id,))
+            if not tpl:
+                raise HTTPException(422, "所选 Prompt 模板不存在或已停用")
+            br = db.query_one("SELECT * FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1",
+                              (get_project_of_node(node_id),)) or {}
+            brief_vars = dict(br)
+            brief_vars["user_prompt"] = prompt.get("prompt", "")
+            prompt = {**prompt,
+                      "prompt": prompt_compiler.compile_prompt(tpl["template_text"], brief_vars),
+                      "prompt_template_id": tpl["id"],
+                      "prompt_template_name": tpl["name"]}
+            used_tpl_id = tpl["id"]
         set_node_version(node_id, prompt, author_type="ai", model_id=model_id or "rule-based-planner")
-        return {"outputs": [], "usage": {"model": model_id or "rule-based-planner"}, "provider_task_id": "prompt"}
+        return {"outputs": [], "usage": {"model": model_id or "rule-based-planner",
+                                         "prompt_template_id": used_tpl_id}, "provider_task_id": "prompt"}
     if ntype == "image_generation":
         pid = get_project_of_node(node_id)
         prompt_content = get_current_version(node_id)
