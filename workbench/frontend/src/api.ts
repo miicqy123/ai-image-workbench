@@ -87,6 +87,7 @@ export const api = {
   exportPackage: (pid: string) => `${BASE}/api/projects/${pid}/export-package`,
 
   getDefaults: (pid: string) => fetch(`${BASE}/api/projects/${pid}/defaults`).then(j<any>),
+  listPromptTemplatesPublic: () => fetch(`${BASE}/api/prompt-templates`).then(j<any[]>),
   listTemplates: () => fetch(`${BASE}/api/templates`).then(j<any[]>),
   adminTemplates: () => fetch(`${BASE}/api/admin/templates`).then(j<any[]>),
   createTemplate: (body: any) => fetch(`${BASE}/api/admin/templates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),

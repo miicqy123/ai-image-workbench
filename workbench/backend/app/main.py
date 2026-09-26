@@ -24,6 +24,7 @@ from .generators import text as text_gen
 from .generators import image as image_gen
 from .services import canvas_renderer
 from .services import model_router
+from .services import prompt_compiler
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -440,6 +441,27 @@ class PromptTemplateIn(BaseModel):
     enabled: int = 1
 
 
+SEED_PROMPT_TEMPLATES = [
+    ("pt1", "夏日清爽产品图", "夏季营销", "生成「{user_prompt}」。夏日清爽风格，明亮正午自然光，产品居中，背景浅蓝与白色渐变，画面干净有气泡感。比例 {aspect_ratio}，适配 {platform}。", "local-poster-compositor"),
+    ("pt2", "高端商拍产品图", "高端商拍", "生成「{user_prompt}」。高端商业产品摄影，柔光棚拍，低饱和高级配色，材质细节清晰，留白充足，适合电商主图。比例 {aspect_ratio}。", "local-poster-compositor"),
+    ("pt3", "小红书种草封面", "社媒封面", "生成「{user_prompt}」。小红书种草风封面，大字标题留白区在顶部，暖色生活场景，突出卖点：{style_keywords}。比例 {aspect_ratio}。", "local-poster-compositor"),
+]
+
+
+def seed_prompt_templates():
+    if db.query_one("SELECT id FROM prompt_templates LIMIT 1"):
+        return
+    now = int(db.now())
+    for t in SEED_PROMPT_TEMPLATES:
+        db.execute("INSERT INTO prompt_templates(id,name,category,template_text,model_hint,enabled,created_at) VALUES(?,?,?,?,?,1,?)", t + (now,))
+
+
+@app.get("/api/prompt-templates")
+def list_prompt_templates_public():
+    seed_prompt_templates()
+    return db.query("SELECT id,name,category,template_text,model_hint FROM prompt_templates WHERE enabled=1 ORDER BY created_at ASC")
+
+
 @app.get("/api/admin/prompt-templates")
 def admin_list_prompt_templates():
     return db.query("SELECT * FROM prompt_templates ORDER BY created_at DESC")
@@ -528,7 +550,15 @@ def create_generation_job(pid: str, body: JobIn):
         raise HTTPException(422, "请先保存 GenerationBrief")
     pv_no = (db.query_one("SELECT count(*) c FROM prompt_versions WHERE project_id=?", (pid,)) or {"c": 0})["c"] + 1
     pv_id = db.gen_id("pv")
-    structured = {"user_prompt": brief["user_prompt"], "platform": brief["platform"], "aspect_ratio": brief["aspect_ratio"]}
+    tpl = None
+    if brief["selected_prompt_template_id"]:
+        tpl = db.query_one("SELECT * FROM prompt_templates WHERE id=?", (brief["selected_prompt_template_id"],))
+        if tpl is None:
+            seed_prompt_templates()
+            tpl = db.query_one("SELECT * FROM prompt_templates WHERE id=?", (brief["selected_prompt_template_id"],))
+    compiled = prompt_compiler.compile_prompt((tpl or {}).get("template_text"), dict(brief))
+    structured = {"user_prompt": brief["user_prompt"], "platform": brief["platform"], "aspect_ratio": brief["aspect_ratio"],
+                  "template_id": brief["selected_prompt_template_id"], "compiled": compiled}
     model_id = body.model_id or brief["selected_model_id"] or "local-poster-compositor"
     product_ids = json_loads(brief["product_asset_ids_json"], [])
     ref_ids = json_loads(brief["reference_asset_ids_json"], [])
@@ -539,7 +569,7 @@ def create_generation_job(pid: str, body: JobIn):
         raise HTTPException(422, str(e))
     db.execute("INSERT INTO prompt_versions(id,project_id,brief_id,source_type,version_no,structured_prompt_json,prompt,negative_prompt,model_id,model_params_json,created_at) "
                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-               (pv_id, pid, brief["id"], "brief", pv_no, json.dumps(structured, ensure_ascii=False), brief["user_prompt"], "",
+               (pv_id, pid, brief["id"], "brief", pv_no, json.dumps(structured, ensure_ascii=False), compiled, "",
                 model_id, json.dumps({"aspect_ratio": brief["aspect_ratio"], "count": brief["image_count"]}, ensure_ascii=False), int(db.now())))
     jid = db.gen_id("job")
     db.execute("INSERT INTO generation_jobs(id,project_id,brief_id,prompt_version_id,model_id,provider_id,task_type,status,progress,created_at) "

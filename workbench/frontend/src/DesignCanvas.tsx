@@ -177,7 +177,7 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
       }
       await api.upsertGenerationBrief(p.id, {
         user_prompt: opts.prompt, purpose: 'marketing_poster', platform: opts.platform,
-        aspect_ratio: opts.ratio, image_count: opts.count, selected_model_id: opts.model_id || null,
+        aspect_ratio: opts.ratio, image_count: opts.count, selected_model_id: opts.model_id || null, selected_prompt_template_id: (opts as any).template_id || null,
         product_asset_ids: uploaded, reference_asset_ids: [],
       })
       mark(3)

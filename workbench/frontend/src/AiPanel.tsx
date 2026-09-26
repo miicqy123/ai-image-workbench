@@ -12,7 +12,7 @@ const PLATFORMS = ['淘宝/天猫', '京东', '拼多多', '抖音', '小红书'
 const RATIOS = ['1:1', '3:4', '4:3', '16:9', '9:16']
 
 interface Props {
-  onGenerate: (opts: { count: number; platform: string; ratio: string; prompt: string; model_id?: string }) => void
+  onGenerate: (opts: { count: number; platform: string; ratio: string; prompt: string; model_id?: string; template_id?: string }) => void
   onUpload: (files: FileList | null) => void
 }
 
@@ -24,8 +24,11 @@ export default function AiPanel({ onGenerate, onUpload }: Props) {
   const [feat, setFeat] = useState(0)
   const [models, setModels] = useState<any[]>([])
   const [modelId, setModelId] = useState('')
+  const [tpls, setTpls] = useState<any[]>([])
+  const [tplId, setTplId] = useState('')
 
   useEffect(() => { api.listModels().then((ms) => setModels(ms.filter((m: any) => m.modality === 'image' && m.enabled === 1))) }, [])
+  useEffect(() => { api.listPromptTemplatesPublic().then(setTpls).catch(() => setTpls([])) }, [])
 
   const cycle = () => {
     const next = (feat + 1) % QUICK_TASKS.length
@@ -61,6 +64,10 @@ export default function AiPanel({ onGenerate, onUpload }: Props) {
             <option value="">默认（本地合成）</option>
             {models.map((m) => <option key={m.model_id} value={m.model_id}>{m.model_id}</option>)}
           </select>
+          <select className="ai-sel" value={tplId} onChange={(e) => setTplId(e.target.value)} title="Prompt 模板">
+            <option value="">Prompt 模板：无</option>
+            {tpls.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
         </div>
         <textarea className="ai-input" placeholder="描述你的灵感，支持 @ 上传图片、选择技能以及 Agent" value={prompt} onChange={(e) => setPrompt(e.target.value)} />
         <input id="ai-file" type="file" accept="image/*" multiple style={{ display: 'none' }} onChange={(e) => { onUpload(e.target.files); e.target.value = '' }} />
@@ -69,7 +76,7 @@ export default function AiPanel({ onGenerate, onUpload }: Props) {
       <div className="ai-actions">
         <button className="btn" onClick={() => document.getElementById('ai-file')?.click()}>选择文件</button>
         <button className="btn">Agent</button>
-        <button className="btn primary" onClick={() => onGenerate({ count, platform, ratio, prompt, model_id: modelId || undefined })}>生成</button>
+        <button className="btn primary" onClick={() => onGenerate({ count, platform, ratio, prompt, model_id: modelId || undefined, template_id: tplId || undefined })}>生成</button>
       </div>
       <div className="ai-disclaimer">内容由 AI 生成</div>
     </aside>

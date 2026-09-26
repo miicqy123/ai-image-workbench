@@ -38,7 +38,9 @@ def _run_job(job):
                 pil_imgs.append(storage.read_pillow(a["object_key"]))
             except Exception:
                 pass
-    req = {"model_id": model_id, "prompt": brief["user_prompt"], "negative_prompt": "",
+    pv = db.query_one("SELECT prompt FROM prompt_versions WHERE id=?", (job.get("prompt_version_id"),)) if job.get("prompt_version_id") else None
+    prompt_text = (pv or {}).get("prompt") or brief["user_prompt"]
+    req = {"model_id": model_id, "prompt": prompt_text, "negative_prompt": "",
            "aspect_ratio": brief["aspect_ratio"], "count": brief["image_count"],
            "task_type": job["task_type"], "params": {}}
     res = image_gen.dispatch(model_id, req, pil_imgs, provider_cfg=provider_cfg, adapter=m.get("adapter"))
