@@ -6,6 +6,7 @@
 import io
 import json
 import os
+import urllib.request
 import threading
 import time
 import zipfile
@@ -22,6 +23,7 @@ from . import registry
 from .generators import text as text_gen
 from .generators import image as image_gen
 from .services import canvas_renderer
+from .services import model_router
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -358,7 +360,13 @@ def create_generation_job(pid: str, body: JobIn):
     pv_id = db.gen_id("pv")
     structured = {"user_prompt": brief["user_prompt"], "platform": brief["platform"], "aspect_ratio": brief["aspect_ratio"]}
     model_id = body.model_id or brief["selected_model_id"] or "local-poster-compositor"
-    m = registry.get_model(model_id) or {}
+    product_ids = json_loads(brief["product_asset_ids_json"], [])
+    ref_ids = json_loads(brief["reference_asset_ids_json"], [])
+    try:
+        m = model_router.validate_model_for_task(model_id, body.task_type, reference_count=len(product_ids) + len(ref_ids),
+                                                 ratio=brief["aspect_ratio"], count=brief["image_count"])
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     db.execute("INSERT INTO prompt_versions(id,project_id,brief_id,source_type,version_no,structured_prompt_json,prompt,negative_prompt,model_id,model_params_json,created_at) "
                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                (pv_id, pid, brief["id"], "brief", pv_no, json.dumps(structured, ensure_ascii=False), brief["user_prompt"], "",
@@ -1202,6 +1210,27 @@ def update_provider_api(pid: str, patch: ProviderUpdate):
 def delete_provider_api(pid: str):
     registry.delete_provider(pid)
     return {"ok": True}
+
+
+@app.post("/api/providers/{pid}/test")
+def test_provider_api(pid: str):
+    p = registry.get_provider(pid)
+    if not p:
+        raise HTTPException(404, "服务商不存在")
+    base = (p["base_url"] or "").rstrip("/")
+    key = p["api_key"] or ""
+    if not base:
+        return {"success": False, "error": "未配置 Base URL"}
+    if not key:
+        return {"success": False, "error": "未配置 API Key"}
+    try:
+        req = urllib.request.Request(base + "/models", headers={"Authorization": "Bearer " + key})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read().decode("utf-8"))
+        ids = [m.get("id") for m in body.get("data", []) if isinstance(m, dict)]
+        return {"success": True, "provider": p["name"], "available_models": ids[:60]}
+    except Exception as e:
+        return {"success": False, "provider": p["name"], "error": str(e)[:200]}
 
 
 # ---------------- image tools（节点悬浮工具栏意图） ----------------
