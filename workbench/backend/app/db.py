@@ -126,6 +126,14 @@ CREATE TABLE IF NOT EXISTS canvas_documents (
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_canvas_documents_project ON canvas_documents(project_id);
+CREATE TABLE IF NOT EXISTS templates (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, subtitle TEXT, level1 TEXT, level2 TEXT,
+    skeleton TEXT, aspect TEXT, accent TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prompt_templates (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT, template_text TEXT NOT NULL,
+    model_hint TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+);
 """
 
 

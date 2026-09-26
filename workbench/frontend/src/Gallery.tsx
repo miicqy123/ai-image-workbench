@@ -1,5 +1,6 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Template, AspectRatio } from './types'
+import { api } from './api'
 
 const LEVELS = [
   { key: 'brand', name: '品牌视觉', subs: ['品牌｜视觉系统', '品牌｜Logo与VI', '品牌｜品牌模板', '品牌｜包装与空间'] },
@@ -51,10 +52,13 @@ interface Props {
 
 export default function Gallery({ onUse, onWorkflow, onDesign, onAdmin }: Props) {
   const [level, setLevel] = useState('marketing')
+  const [templates, setTemplates] = useState<Template[]>(TEMPLATES)
+
+  useEffect(() => { api.listTemplates().then((ts) => { if (ts && ts.length) setTemplates(ts as any) }).catch(() => {}) }, [])
   const [sub, setSub] = useState('')
 
   const cur = LEVELS.find((l) => l.key === level)!
-  const shown = TEMPLATES.filter((t) => t.level1 === level && (!sub || t.level2 === sub))
+  const shown = templates.filter((t) => t.level1 === level && (!sub || t.level2 === sub))
 
   return (
     <div className="gallery">

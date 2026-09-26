@@ -10,6 +10,8 @@ const TABS = [
   { key: 'runs', label: '运行记录' },
   { key: 'audit', label: '审计日志' },
   { key: 'assets', label: '素材' },
+  { key: 'templates', label: '模板中心' },
+  { key: 'prompts', label: 'Prompt 管理' },
   { key: 'models', label: '模型 / 服务商' },
 ] as const
 
@@ -21,7 +23,9 @@ export default function Admin({ onBack }: { onBack: () => void }) {
   const [models, setModels] = useState<any[]>([])
   const [providers, setProviders] = useState<any[]>([])
   const [assets, setAssets] = useState<any[]>([])
-  const [tab, setTab] = useState<'projects' | 'runs' | 'audit' | 'models' | 'assets'>('projects')
+  const [templates, setTemplates] = useState<any[]>([])
+  const [prompts, setPrompts] = useState<any[]>([])
+  const [tab, setTab] = useState<'projects' | 'runs' | 'audit' | 'models' | 'assets' | 'templates' | 'prompts'>('projects')
   const [showModels, setShowModels] = useState(false)
 
   const refresh = async () => {
@@ -32,6 +36,8 @@ export default function Admin({ onBack }: { onBack: () => void }) {
     setModels(await api.listModels())
     setProviders(await api.listProviders())
     setAssets(await api.listAllAssets())
+    setTemplates(await api.adminTemplates())
+    setPrompts(await api.listPromptTemplates())
   }
   useEffect(() => { refresh() }, [])
 
@@ -114,6 +120,37 @@ export default function Admin({ onBack }: { onBack: () => void }) {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {tab === 'templates' && (
+          <div>
+            <div className="admin-models-head"><h2>模板中心（{templates.length}）</h2>
+              <button className="btn primary" onClick={async () => { const name = prompt('模板名称'); if (!name) return; const l2 = prompt('二级分类（如 营销｜品牌海报）') || ''; const sk = prompt('工作流骨架 poster/long/detail/cover/illustration', 'poster') || 'poster'; await api.createTemplate({ name, level2: l2, skeleton: sk }); refresh() }}>+ 新增模板</button>
+            </div>
+            <table className="admin-table">
+              <thead><tr><th>名称</th><th>一级</th><th>二级</th><th>骨架</th><th>比例</th><th>状态</th><th>操作</th></tr></thead>
+              <tbody>{templates.map((t) => (
+                <tr key={t.id}><td>{t.name}</td><td>{t.level1}</td><td>{t.level2}</td><td>{t.skeleton}</td><td>{t.aspect}</td>
+                  <td>{t.enabled ? '启用' : '停用'}</td>
+                  <td><button className="btn danger" onClick={async () => { if (confirm('删除该模板？')) { await api.deleteTemplate(t.id); refresh() } }}>删除</button></td></tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+
+        {tab === 'prompts' && (
+          <div>
+            <div className="admin-models-head"><h2>Prompt 管理（{prompts.length}）</h2>
+              <button className="btn primary" onClick={async () => { const name = prompt('Prompt 名称'); if (!name) return; const cat = prompt('分类') || ''; const text = prompt('Prompt 模板正文') || ''; await api.createPromptTemplate({ name, category: cat, template_text: text }); refresh() }}>+ 新增 Prompt</button>
+            </div>
+            <table className="admin-table">
+              <thead><tr><th>名称</th><th>分类</th><th>模板正文</th><th>操作</th></tr></thead>
+              <tbody>{prompts.map((p) => (
+                <tr key={p.id}><td>{p.name}</td><td>{p.category}</td><td className="mono">{String(p.template_text).slice(0, 60)}</td>
+                  <td><button className="btn danger" onClick={async () => { if (confirm('删除该 Prompt？')) { await api.deletePromptTemplate(p.id); refresh() } }}>删除</button></td></tr>
+              ))}</tbody>
+            </table>
           </div>
         )}
 

@@ -87,6 +87,14 @@ export const api = {
   exportPackage: (pid: string) => `${BASE}/api/projects/${pid}/export-package`,
 
   getDefaults: (pid: string) => fetch(`${BASE}/api/projects/${pid}/defaults`).then(j<any>),
+  listTemplates: () => fetch(`${BASE}/api/templates`).then(j<any[]>),
+  adminTemplates: () => fetch(`${BASE}/api/admin/templates`).then(j<any[]>),
+  createTemplate: (body: any) => fetch(`${BASE}/api/admin/templates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  deleteTemplate: (id: string) => fetch(`${BASE}/api/admin/templates/${id}`, { method: 'DELETE' }).then(j<any>),
+  listPromptTemplates: () => fetch(`${BASE}/api/admin/prompt-templates`).then(j<any[]>),
+  createPromptTemplate: (body: any) => fetch(`${BASE}/api/admin/prompt-templates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  deletePromptTemplate: (id: string) => fetch(`${BASE}/api/admin/prompt-templates/${id}`, { method: 'DELETE' }).then(j<any>),
+
   creatorDashboard: () => fetch(`${BASE}/api/creator/dashboard`).then(j<any>),
   archiveProject: (pid: string) => fetch(`${BASE}/api/projects/${pid}/archive`, { method: 'POST' }).then(j<any>),
   restoreProject: (pid: string) => fetch(`${BASE}/api/projects/${pid}/restore`, { method: 'POST' }).then(j<any>),

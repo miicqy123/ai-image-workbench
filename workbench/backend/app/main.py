@@ -345,6 +345,120 @@ def upsert_brief(pid: str, body: BriefIn):
     return _brief_dict(db.query_one("SELECT * FROM generation_briefs WHERE id=?", (bid,)))
 
 
+# ---------------- 模板中心 / Prompt 管理 ----------------
+SEED_TEMPLATES = [
+    ("b1", "Logo / VI 设计", "品牌标识与视觉规范", "brand", "品牌｜Logo与VI", "illustration", "1:1", "#7C3AED"),
+    ("b2", "品牌视觉系统", "色彩 / 字体 / 版式规范", "brand", "品牌｜视觉系统", "illustration", "4:3", "#6366F1"),
+    ("m1", "品牌形象海报", "品牌主张 / 价值表达", "marketing", "营销｜品牌海报", "poster", "3:4", "#7C3AED"),
+    ("m2", "产品卖点海报", "主卖点 + 场景 + 证明", "marketing", "营销｜产品海报", "poster", "1:1", "#3B82F6"),
+    ("m3", "服务承诺海报", "风险反转 / 无醛承诺", "marketing", "营销｜服务海报", "poster", "3:4", "#10B981"),
+    ("m4", "活动传播海报", "活动主题 + 节点 + 权益", "marketing", "营销｜活动海报", "poster", "3:4", "#EF4444"),
+    ("m5", "促销转化海报", "算账 + 权益 + 限时", "marketing", "营销｜促销海报", "poster", "3:4", "#F59E0B"),
+    ("m6", "信任背书海报", "检测 / 人物 / 案例", "marketing", "营销｜背书/案例海报", "poster", "3:4", "#6366F1"),
+    ("m7", "系列节点海报", "发布会 / 倒计时 / 悬念", "marketing", "营销｜系列节点海报", "poster", "3:4", "#8B5CF6"),
+    ("c1", "视频号 / 抖音封面", "竖版封面 · 9:16", "content", "内容｜视频封面", "cover", "9:16", "#F59E0B"),
+    ("c2", "公众号封面", "大字标题 · 16:9", "content", "内容｜图文封面", "cover", "16:9", "#10B981"),
+    ("c3", "小红书图文封面", "种草 / 攻略 · 3:4", "content", "内容｜图文封面", "cover", "3:4", "#EC4899"),
+    ("c4", "朋友圈海报", "悬念 / 金句 · 3:4", "content", "内容｜图文封面", "cover", "3:4", "#3B82F6"),
+    ("c5", "会后成果长图", "结论 + 过程 + 成果", "content", "内容｜传播长图", "long", "a4", "#3B82F6"),
+    ("c6", "攻略 / 科普信息图", "误区 + 判断工具", "content", "内容｜信息图", "long", "a4", "#14B8A6"),
+    ("c7", "社媒轮播图", "多张轮播 · 3:4", "content", "内容｜社媒轮播图", "detail", "3:4", "#EC4899"),
+    ("e1", "电商主图套图", "全套主图 · 1:1", "ecommerce", "电商｜电商主图", "detail", "1:1", "#7C3AED"),
+    ("e2", "商品详情页", "参数 / 卖点 / 场景", "ecommerce", "电商｜详情页", "detail", "a4", "#6366F1"),
+    ("e3", "商品场景图", "场景适配 · 多尺寸", "ecommerce", "电商｜场景图", "poster", "3:4", "#EC4899"),
+    ("e4", "细节 / 参数图", "特写 + 参数标注", "ecommerce", "电商｜细节/参数图", "poster", "1:1", "#14B8A6"),
+    ("i1", "场景插图", "生活场景 / 使用示意", "illustration", "素材｜内容插图", "illustration", "1:1", "#8B5CF6"),
+    ("i2", "编辑插图", "图文配图 / 栏目插图", "illustration", "素材｜内容插图", "illustration", "4:3", "#14B8A6"),
+    ("i3", "角色 / IP 与吉祥物", "品牌 IP 形象", "illustration", "素材｜角色IP", "illustration", "1:1", "#F59E0B"),
+]
+
+
+def seed_templates():
+    if db.query_one("SELECT id FROM templates LIMIT 1"):
+        return
+    now = int(db.now())
+    for t in SEED_TEMPLATES:
+        db.execute("INSERT INTO templates(id,name,subtitle,level1,level2,skeleton,aspect,accent,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,1,?)",
+                   t + (now,))
+
+
+@app.get("/api/templates")
+def list_templates():
+    seed_templates()
+    return db.query("SELECT id,name,subtitle,level1,level2,skeleton,aspect,accent,enabled FROM templates WHERE enabled=1 ORDER BY created_at ASC")
+
+
+class TemplateIn(BaseModel):
+    id: Optional[str] = None
+    name: str
+    subtitle: str = ""
+    level1: str = "marketing"
+    level2: str = ""
+    skeleton: str = "poster"
+    aspect: str = "3:4"
+    accent: str = "#7C3AED"
+    enabled: int = 1
+
+
+@app.get("/api/admin/templates")
+def admin_list_templates():
+    seed_templates()
+    return db.query("SELECT * FROM templates ORDER BY created_at ASC")
+
+
+@app.post("/api/admin/templates", status_code=201)
+def admin_create_template(body: TemplateIn):
+    tid = body.id or db.gen_id("tpl")
+    if db.query_one("SELECT id FROM templates WHERE id=?", (tid,)):
+        raise HTTPException(400, "模板 ID 已存在")
+    db.execute("INSERT INTO templates(id,name,subtitle,level1,level2,skeleton,aspect,accent,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               (tid, body.name, body.subtitle, body.level1, body.level2, body.skeleton, body.aspect, body.accent, int(body.enabled), int(db.now())))
+    return db.query_one("SELECT * FROM templates WHERE id=?", (tid,))
+
+
+@app.put("/api/admin/templates/{tid}")
+def admin_update_template(tid: str, body: TemplateIn):
+    if not db.query_one("SELECT id FROM templates WHERE id=?", (tid,)):
+        raise HTTPException(404, "模板不存在")
+    db.execute("UPDATE templates SET name=?,subtitle=?,level1=?,level2=?,skeleton=?,aspect=?,accent=?,enabled=? WHERE id=?",
+               (body.name, body.subtitle, body.level1, body.level2, body.skeleton, body.aspect, body.accent, int(body.enabled), tid))
+    return db.query_one("SELECT * FROM templates WHERE id=?", (tid,))
+
+
+@app.delete("/api/admin/templates/{tid}")
+def admin_delete_template(tid: str):
+    db.execute("DELETE FROM templates WHERE id=?", (tid,))
+    return {"ok": True}
+
+
+class PromptTemplateIn(BaseModel):
+    id: Optional[str] = None
+    name: str
+    category: str = ""
+    template_text: str
+    model_hint: str = ""
+    enabled: int = 1
+
+
+@app.get("/api/admin/prompt-templates")
+def admin_list_prompt_templates():
+    return db.query("SELECT * FROM prompt_templates ORDER BY created_at DESC")
+
+
+@app.post("/api/admin/prompt-templates", status_code=201)
+def admin_create_prompt_template(body: PromptTemplateIn):
+    pid = body.id or db.gen_id("ptpl")
+    db.execute("INSERT INTO prompt_templates(id,name,category,template_text,model_hint,enabled,created_at) VALUES(?,?,?,?,?,?,?)",
+               (pid, body.name, body.category, body.template_text, body.model_hint, int(body.enabled), int(db.now())))
+    return db.query_one("SELECT * FROM prompt_templates WHERE id=?", (pid,))
+
+
+@app.delete("/api/admin/prompt-templates/{pid}")
+def admin_delete_prompt_template(pid: str):
+    db.execute("DELETE FROM prompt_templates WHERE id=?", (pid,))
+    return {"ok": True}
+
+
 # ---------------- 前台工作台 ----------------
 @app.get("/api/creator/dashboard")
 def creator_dashboard():
