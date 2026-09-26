@@ -63,6 +63,8 @@ def _dims(aspect: str, tier: str):
         return int(base * 3 / 4), base
     if a == "16:9":
         return base, int(base * 9 / 16)
+    if a == "9:16":
+        return int(base * 9 / 16), base
     return base, base
 
 
@@ -205,9 +207,28 @@ class CommercialApiAdapter:
         raise NotImplementedError("商业图片 API 适配器未启用：请配置密钥与授权范围后启用，并确保数据出境合规。")
 
 
+TASK_TYPES = ["text_to_image", "image_to_image", "product_composition", "inpaint", "outpaint", "upscale", "background_replace"]
+
+# 只声明适配器"实际实现"的任务类型（未真实传递参考图的不声明 image_to_image）
+ADAPTER_TASKS = {
+    "local": ["text_to_image", "image_to_image", "product_composition"],
+    "image_openai": ["text_to_image"],
+    "image_dashscope": ["text_to_image"],
+}
+
+
+def supports_task(adapter: str | None, task_type: str) -> bool:
+    return task_type in ADAPTER_TASKS.get(adapter or "", [])
+
+
 def dispatch(model_id: str, req: dict, reference_images: list, provider_cfg: dict | None = None, adapter: str | None = None) -> dict:
-    if model_id == "local-poster-compositor":
+    task_type = req.get("task_type", "text_to_image")
+    if model_id in ("local-poster-compositor", "demo-poster-compositor"):
+        if task_type not in ("text_to_image", "image_to_image", "product_composition"):
+            raise ValueError(f"演示拼接器不支持任务类型 {task_type}")
         return generate(req, reference_images)
+    if adapter and not supports_task(adapter, task_type):
+        raise ValueError(f"模型 {model_id} 不支持任务类型 {task_type}；该适配器当前支持：{ADAPTER_TASKS.get(adapter, [])}")
     if adapter == "image_openai" and provider_cfg:
         return generate_openai_image(model_id, provider_cfg, req)
     if adapter == "image_dashscope" and provider_cfg:
@@ -304,7 +325,7 @@ def _http_json(url: str, payload: dict, key: str, timeout: int = 120) -> dict:
 
 
 def _size_for(aspect: str) -> str:
-    return {"1:1": "1024x1024", "4:3": "1280x960", "3:4": "960x1280", "16:9": "1280x720"}.get((aspect or "1:1").replace(" ", ""), "1024x1024")
+    return {"1:1": "1024x1024", "4:3": "1280x960", "3:4": "960x1280", "16:9": "1280x720", "9:16": "720x1280"}.get((aspect or "1:1").replace(" ", ""), "1024x1024")
 
 
 def generate_openai_image(model_id: str, provider_cfg: dict, req: dict) -> dict:

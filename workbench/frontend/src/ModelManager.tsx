@@ -77,7 +77,8 @@ export default function ModelManager({ models, onClose, onChanged, showToast }: 
     if (!(provForm.name || '').trim()) { showToast('服务商名称必填'); return }
     setSaving(true)
     try {
-      const body = { name: provForm.name, base_url: provForm.base_url || '', api_key: provForm.api_key || '', enabled: provForm.enabled }
+      const body: any = { name: provForm.name, base_url: provForm.base_url || '', enabled: provForm.enabled }
+      if ((provForm.api_key || '').trim()) body.api_key = provForm.api_key
       if (provForm.isNew) await api.createProvider(body)
       else await api.updateProvider(provForm.id!, body)
       showToast('已保存服务商'); setProvForm(null); refreshProviders()
@@ -129,7 +130,7 @@ export default function ModelManager({ models, onClose, onChanged, showToast }: 
               <div className="mm-card" key={p.id}>
                 <div className="mm-main">
                   <div className="mm-title">{p.name}</div>
-                  <div className="meta">{p.base_url || '（未配置 Base URL）'} · Key: {p.api_key ? '已填写' : '未填写'}</div>
+                  <div className="meta">{p.base_url || '（未配置 Base URL）'} · Key: {p.has_api_key ? '已配置' : '未配置'}</div>
                 </div>
                 <div className="mm-actions">
                   <button className="btn" onClick={() => setProvForm({ ...p, isNew: false })}>编辑</button>

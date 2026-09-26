@@ -21,6 +21,7 @@ from . import db, storage
 from . import registry
 from .generators import text as text_gen
 from .generators import image as image_gen
+from .services import canvas_renderer
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -250,6 +251,203 @@ def put_defaults(pid: str, body: DefaultsUpdate):
         db.execute(f"UPDATE projects SET {setc} WHERE id=?", tuple(fields.values()) + (pid,))
     db.execute("UPDATE projects SET updated_at=? WHERE id=?", (db.now(), pid))
     return get_defaults(pid)
+
+
+# ---------------- generation brief（唯一生图输入源） ----------------
+class BriefIn(BaseModel):
+    user_prompt: str = ""
+    purpose: str = "marketing_poster"
+    platform: str = "xiaohongshu"
+    aspect_ratio: str = "3:4"
+    image_count: int = 4
+    selected_model_id: Optional[str] = None
+    selected_prompt_template_id: Optional[str] = None
+    reference_asset_ids: list = []
+    product_asset_ids: list = []
+    style_keywords: list = []
+    brand_keywords: list = []
+
+
+def _brief_dict(r):
+    return {
+        "id": r["id"], "project_id": r["project_id"], "user_prompt": r["user_prompt"],
+        "purpose": r["purpose"], "platform": r["platform"], "aspect_ratio": r["aspect_ratio"],
+        "image_count": r["image_count"], "selected_model_id": r["selected_model_id"],
+        "selected_prompt_template_id": r["selected_prompt_template_id"],
+        "reference_asset_ids": json_loads(r["reference_asset_ids_json"], []),
+        "product_asset_ids": json_loads(r["product_asset_ids_json"], []),
+        "style_keywords": json_loads(r["style_keywords_json"], []),
+        "brand_keywords": json_loads(r["brand_keywords_json"], []),
+        "created_at": r["created_at"], "updated_at": r["updated_at"],
+    }
+
+
+def _brief_vals(b: BriefIn):
+    return (b.user_prompt, b.purpose, b.platform, b.aspect_ratio, b.image_count,
+            b.selected_model_id, b.selected_prompt_template_id,
+            json.dumps(b.reference_asset_ids), json.dumps(b.product_asset_ids),
+            json.dumps(b.style_keywords), json.dumps(b.brand_keywords))
+
+
+BRIEF_COLS = ("id,project_id,user_prompt,purpose,platform,aspect_ratio,image_count,selected_model_id,"
+              "selected_prompt_template_id,reference_asset_ids_json,product_asset_ids_json,"
+              "style_keywords_json,brand_keywords_json,created_at,updated_at")
+
+
+@app.get("/api/projects/{pid}/brief")
+def get_brief(pid: str):
+    r = db.query_one("SELECT * FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    if not r:
+        raise HTTPException(404, "brief 不存在")
+    return _brief_dict(r)
+
+
+@app.post("/api/projects/{pid}/brief", status_code=201)
+def create_brief(pid: str, body: BriefIn):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    bid = db.gen_id("brief"); now = int(db.now())
+    db.execute("INSERT INTO generation_briefs(" + BRIEF_COLS + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (bid, pid) + _brief_vals(body) + (now, now))
+    return _brief_dict(db.query_one("SELECT * FROM generation_briefs WHERE id=?", (bid,)))
+
+
+@app.put("/api/projects/{pid}/brief")
+def upsert_brief(pid: str, body: BriefIn):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    now = int(db.now())
+    ex = db.query_one("SELECT id FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    if ex:
+        db.execute("UPDATE generation_briefs SET user_prompt=?,purpose=?,platform=?,aspect_ratio=?,image_count=?,"
+                   "selected_model_id=?,selected_prompt_template_id=?,reference_asset_ids_json=?,product_asset_ids_json=?,"
+                   "style_keywords_json=?,brand_keywords_json=?,updated_at=? WHERE id=?",
+                   _brief_vals(body) + (now, ex["id"]))
+        return _brief_dict(db.query_one("SELECT * FROM generation_briefs WHERE id=?", (ex["id"],)))
+    bid = db.gen_id("brief")
+    db.execute("INSERT INTO generation_briefs(" + BRIEF_COLS + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (bid, pid) + _brief_vals(body) + (now, now))
+    return _brief_dict(db.query_one("SELECT * FROM generation_briefs WHERE id=?", (bid,)))
+
+
+# ---------------- 生图任务（jobs / candidates） ----------------
+class JobIn(BaseModel):
+    model_id: Optional[str] = None
+    task_type: str = "text_to_image"
+
+
+@app.post("/api/projects/{pid}/generation-jobs", status_code=201)
+def create_generation_job(pid: str, body: JobIn):
+    brief = db.query_one("SELECT * FROM generation_briefs WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    if not brief:
+        raise HTTPException(422, "请先保存 GenerationBrief")
+    pv_no = (db.query_one("SELECT count(*) c FROM prompt_versions WHERE project_id=?", (pid,)) or {"c": 0})["c"] + 1
+    pv_id = db.gen_id("pv")
+    structured = {"user_prompt": brief["user_prompt"], "platform": brief["platform"], "aspect_ratio": brief["aspect_ratio"]}
+    model_id = body.model_id or brief["selected_model_id"] or "local-poster-compositor"
+    m = registry.get_model(model_id) or {}
+    db.execute("INSERT INTO prompt_versions(id,project_id,brief_id,source_type,version_no,structured_prompt_json,prompt,negative_prompt,model_id,model_params_json,created_at) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+               (pv_id, pid, brief["id"], "brief", pv_no, json.dumps(structured, ensure_ascii=False), brief["user_prompt"], "",
+                model_id, json.dumps({"aspect_ratio": brief["aspect_ratio"], "count": brief["image_count"]}, ensure_ascii=False), int(db.now())))
+    jid = db.gen_id("job")
+    db.execute("INSERT INTO generation_jobs(id,project_id,brief_id,prompt_version_id,model_id,provider_id,task_type,status,progress,created_at) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?)",
+               (jid, pid, brief["id"], pv_id, model_id, m.get("provider_id"), body.task_type, "queued", 0, int(db.now())))
+    return db.query_one("SELECT * FROM generation_jobs WHERE id=?", (jid,))
+
+
+@app.get("/api/generation-jobs/{jid}")
+def get_generation_job(jid: str):
+    r = db.query_one("SELECT * FROM generation_jobs WHERE id=?", (jid,))
+    if not r:
+        raise HTTPException(404, "任务不存在")
+    return r
+
+
+@app.post("/api/generation-jobs/{jid}/cancel")
+def cancel_generation_job(jid: str):
+    db.execute("UPDATE generation_jobs SET status='canceled', finished_at=? WHERE id=? AND status IN ('queued','running')", (int(db.now()), jid))
+    return {"ok": True}
+
+
+@app.get("/api/projects/{pid}/candidates")
+def list_candidates(pid: str):
+    return db.query("SELECT * FROM generation_candidates WHERE project_id=? ORDER BY created_at DESC", (pid,))
+
+
+@app.post("/api/candidates/{cid}/select")
+def select_candidate(cid: str):
+    c = db.query_one("SELECT project_id FROM generation_candidates WHERE id=?", (cid,))
+    if not c:
+        raise HTTPException(404, "候选不存在")
+    db.execute("UPDATE generation_candidates SET is_selected=0 WHERE project_id=?", (c["project_id"],))
+    db.execute("UPDATE generation_candidates SET is_selected=1 WHERE id=?", (cid,))
+    return {"ok": True}
+
+
+# ---------------- 画布文档（可保存 + 真实导出） ----------------
+class CanvasIn(BaseModel):
+    width: int = 768
+    height: int = 1024
+    document: dict = {}
+    candidate_id: Optional[str] = None
+
+
+@app.get("/api/projects/{pid}/canvas")
+def get_canvas(pid: str):
+    r = db.query_one("SELECT * FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    if not r:
+        raise HTTPException(404, "画布不存在")
+    return {"id": r["id"], "project_id": r["project_id"], "width": r["width"], "height": r["height"],
+            "document": json_loads(r["canvas_json"], {})}
+
+
+@app.put("/api/projects/{pid}/canvas")
+def put_canvas(pid: str, body: CanvasIn):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    now = int(db.now())
+    ex = db.query_one("SELECT id FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    doc_json = json.dumps(body.document, ensure_ascii=False)
+    if ex:
+        db.execute("UPDATE canvas_documents SET width=?,height=?,canvas_json=?,candidate_id=COALESCE(?,candidate_id),updated_at=? WHERE id=?",
+                   (body.width, body.height, doc_json, body.candidate_id, now, ex["id"]))
+        cid = ex["id"]
+    else:
+        cid = db.gen_id("cvs")
+        db.execute("INSERT INTO canvas_documents(id,project_id,candidate_id,width,height,canvas_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                   (cid, pid, body.candidate_id, body.width, body.height, doc_json, now, now))
+    return {"ok": True, "id": cid}
+
+
+@app.post("/api/projects/{pid}/canvas/export")
+def export_canvas(pid: str):
+    r = db.query_one("SELECT * FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+    if not r:
+        raise HTTPException(422, "请先保存画布")
+    doc = json_loads(r["canvas_json"], {})
+
+    def loader(aid):
+        if not aid:
+            return None
+        a = db.query_one("SELECT object_key FROM assets WHERE id=? AND project_id=?", (aid, pid))
+        if not a:
+            return None
+        try:
+            return storage.read_pillow(a["object_key"])
+        except Exception:
+            return None
+
+    png = canvas_renderer.render_canvas(doc, loader)
+    aid = db.gen_id("ast")
+    obj_key = f"{pid}/{aid}.png"
+    storage.save_bytes(obj_key, png)
+    db.execute("INSERT INTO assets(id,tenant_id,project_id,kind,role,object_key,sha256,mime,width,height,created_at,source,origin,usage_rights_status) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (aid, "tnt_default", pid, "image", "export", obj_key, "", "image/png",
+                int(doc.get("width") or 768), int(doc.get("height") or 1024), db.now(), "canvas_export", "manual", "exported"))
+    return {"asset_id": aid, "download_url": f"/files/{aid}"}
 
 
 # ---------------- assets ----------------
@@ -956,7 +1154,8 @@ class ProviderUpdate(BaseModel):
 
 @app.get("/api/providers")
 def list_providers_api():
-    return registry.list_providers()
+    return [{"id": p["id"], "name": p["name"], "base_url": p["base_url"], "enabled": p["enabled"],
+             "has_api_key": bool(p.get("api_key"))} for p in registry.list_providers()]
 
 
 @app.post("/api/providers", status_code=201)

@@ -90,6 +90,42 @@ CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY, project_id TEXT, actor_id TEXT, action TEXT,
     entity_id TEXT, before_version INT, after_version INT, time REAL
 );
+CREATE TABLE IF NOT EXISTS generation_briefs (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, user_prompt TEXT NOT NULL,
+    purpose TEXT NOT NULL, platform TEXT NOT NULL, aspect_ratio TEXT NOT NULL,
+    image_count INTEGER NOT NULL, selected_model_id TEXT, selected_prompt_template_id TEXT,
+    reference_asset_ids_json TEXT NOT NULL, product_asset_ids_json TEXT NOT NULL,
+    style_keywords_json TEXT NOT NULL, brand_keywords_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_generation_briefs_project_id ON generation_briefs(project_id);
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, brief_id TEXT NOT NULL,
+    source_type TEXT NOT NULL, version_no INTEGER NOT NULL,
+    structured_prompt_json TEXT NOT NULL, prompt TEXT NOT NULL, negative_prompt TEXT,
+    model_id TEXT, model_params_json TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS generation_jobs (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, brief_id TEXT NOT NULL, prompt_version_id TEXT,
+    model_id TEXT NOT NULL, provider_id TEXT, task_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued', progress INTEGER NOT NULL DEFAULT 0,
+    idempotency_key TEXT, provider_task_id TEXT, error_code TEXT, error_message TEXT,
+    created_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_status ON generation_jobs(status);
+CREATE TABLE IF NOT EXISTS generation_candidates (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, job_id TEXT NOT NULL, prompt_version_id TEXT,
+    asset_id TEXT NOT NULL, model_id TEXT NOT NULL, provider_id TEXT, provider_task_id TEXT,
+    width INTEGER, height INTEGER, seed INTEGER, status TEXT NOT NULL DEFAULT 'ready',
+    score INTEGER, is_selected INTEGER NOT NULL DEFAULT 0, metadata_json TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_generation_candidates_project ON generation_candidates(project_id);
+CREATE TABLE IF NOT EXISTS canvas_documents (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, candidate_id TEXT,
+    width INTEGER NOT NULL, height INTEGER NOT NULL, canvas_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_documents_project ON canvas_documents(project_id);
 """
 
 
@@ -136,6 +172,10 @@ def init_db() -> None:
         ncols = [r["name"] for r in conn.execute("PRAGMA table_info(nodes)")]
         if "name" not in ncols:
             conn.execute("ALTER TABLE nodes ADD COLUMN name TEXT")
+        mcols2 = [r["name"] for r in conn.execute("PRAGMA table_info(model_registry)")]
+        for col in ("display_name", "task_types_json"):
+            if col not in mcols2:
+                conn.execute(f"ALTER TABLE model_registry ADD COLUMN {col} TEXT")
         conn.commit()
         # 默认租户，便于单机演示（生产应做真实鉴权与隔离）
         conn.execute("INSERT OR IGNORE INTO tenants(id,name) VALUES(?,?)", ("tnt_default", "默认企业租户"))

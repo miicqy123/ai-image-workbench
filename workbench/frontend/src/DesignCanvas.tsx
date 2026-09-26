@@ -41,6 +41,7 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
   const [busy, setBusy] = useState(false)
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([])
   const [generatedAssets, setGeneratedAssets] = useState<string[]>([])
+  const [projectId, setProjectId] = useState('')
   const [workflow, setWorkflow] = useState<{ stages: { id: string; label: string; status: string }[]; current: number } | null>(null)
   const boardRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<Drag | null>(null)
@@ -139,6 +140,27 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
     throw new Error('运行超时')
   }
 
+  const toLayers = () => elements.map((el) => {
+    if (el.type === 'image') {
+      const m = /\/files\/([^/?]+)/.exec(el.imageUrl || '')
+      return { type: 'image', asset_id: m ? m[1] : null, x: el.x, y: el.y, width: el.w, height: el.h }
+    }
+    if (el.type === 'sticky') return { type: 'sticky', text: el.text || '', color: el.color || '#FEF3C7', x: el.x, y: el.y, width: el.w, height: el.h }
+    if (el.type === 'shape') return { type: 'rect', color: el.color || '#9CA3AF', x: el.x, y: el.y, width: el.w, height: el.h }
+    if (el.type === 'text') return { type: 'text', text: el.text || '', font_size: 24, fill: '#0F172A', x: el.x, y: el.y, width: el.w, height: el.h }
+    return null
+  }).filter(Boolean)
+
+  const exportCanvasPng = async () => {
+    if (!projectId) { notify('请先点「生成」创建项目'); return }
+    try {
+      await api.putCanvas(projectId, { width: size.w, height: size.h, document: { version: 1, width: size.w, height: size.h, layers: toLayers() } })
+      const r = await api.exportCanvas(projectId)
+      window.open(fileUrl(r.asset_id))
+      notify('已导出画布 PNG（含全部图层）')
+    } catch (e: any) { notify('导出失败：' + (e?.message || e)) }
+  }
+
   const onGenerate = async (opts: { count: number; platform: string; ratio: string; prompt: string; model_id?: string }) => {
     setBusy(true)
     setWorkflow({ stages: WORKFLOW_STAGES.map((s, i) => ({ id: 's' + i, label: s, status: i === 0 ? 'active' : 'pending' })), current: 0 })
@@ -146,6 +168,7 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
     try {
       // 建项目 + 初始化对应工作流骨架
       const p = await api.createProject(template.name + (opts.platform ? ' · ' + opts.platform : ''))
+      setProjectId(p.id)
       await api.initTemplate(p.id, template.skeleton || 'poster')
       const g = await api.getGraph(p.id)
       // 上传产品图并挂载到产品图节点
@@ -154,6 +177,11 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
         const a = await api.uploadAsset(p.id, f, 'product')
         uploaded.push(a.id)
       }
+      await api.upsertGenerationBrief(p.id, {
+        user_prompt: opts.prompt, purpose: 'marketing_poster', platform: opts.platform,
+        aspect_ratio: opts.ratio, image_count: opts.count, selected_model_id: opts.model_id || null,
+        reference_asset_ids: [], product_asset_ids: uploaded, style_keywords: [], brand_keywords: [],
+      })
       const imgNode = g.nodes.find((n) => n.type === 'product_image')
       if (imgNode && uploaded.length) {
         await api.patchNode(imgNode.id, { content: { asset_id: uploaded[0], reference_asset_ids: uploaded, asset_role: 'product', filename: 'product' } })
@@ -278,6 +306,7 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
                   </div>
                   <div className="mm-form-actions">
                     <button className="btn primary" onClick={() => generatedAssets.forEach((aid, i) => download(fileUrl(aid), `${template.name}_${i + 1}.png`))}>下载全部</button>
+                    <button className="btn primary" onClick={exportCanvasPng}>导出画布 PNG（含图层）</button>
                     <button className="btn" onClick={() => setShowExport(false)}>关闭</button>
                   </div>
                 </>

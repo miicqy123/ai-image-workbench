@@ -6,6 +6,7 @@
 遵循 PRD 6.5：仅当模型具备能力才提供对应按钮；服务端再次校验。
 """
 import json
+import os
 from . import db
 
 SEED_PROVIDERS = [
@@ -61,9 +62,11 @@ SEED_MODELS = [
             "bg_style": {"type": "string", "default": "auto"},
             "seed": {"type": "int", "optional": True},
         }),
-        "enabled": 1,
+        "enabled": 1 if os.environ.get("WB_ENABLE_DEMO_COMPOSITOR", "true").lower() != "false" else 0,
         "cost_policy": "free_local",
         "workflow_version": "compositor-v1",
+        "display_name": "演示拼贴生成器（非 AI 生图）",
+        "task_types_json": '["text_to_image", "image_to_image", "product_composition"]',
     },
     {
         "model_id": "comfyui-product-edit",

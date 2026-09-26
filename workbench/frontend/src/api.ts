@@ -87,6 +87,16 @@ export const api = {
   exportPackage: (pid: string) => `${BASE}/api/projects/${pid}/export-package`,
 
   getDefaults: (pid: string) => fetch(`${BASE}/api/projects/${pid}/defaults`).then(j<any>),
+  getCanvas: (pid: string) => fetch(`${BASE}/api/projects/${pid}/canvas`).then(j<any>),
+  putCanvas: (pid: string, body: any) =>
+    fetch(`${BASE}/api/projects/${pid}/canvas`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  exportCanvas: (pid: string) =>
+    fetch(`${BASE}/api/projects/${pid}/canvas/export`, { method: 'POST' }).then(j<any>),
+
+  getGenerationBrief: (pid: string) => fetch(`${BASE}/api/projects/${pid}/brief`).then(j<any>),
+  upsertGenerationBrief: (pid: string, body: any) =>
+    fetch(`${BASE}/api/projects/${pid}/brief`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+
   setDefaults: (pid: string, body: any) =>
     fetch(`${BASE}/api/projects/${pid}/defaults`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
 

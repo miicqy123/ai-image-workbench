@@ -51,7 +51,8 @@ export interface Provider {
   id: string
   name: string
   base_url: string
-  api_key: string
+  api_key?: string
+  has_api_key?: boolean
   enabled: number
 }
 
