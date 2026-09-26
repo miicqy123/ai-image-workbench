@@ -1175,6 +1175,50 @@ if __name__ == "__main__":
 # 生产便捷：若前端已构建 dist，则单端口托管（API 路由已在上方注册，优先匹配）
 import os as _os
 _DIST = _os.path.normpath(_os.path.join(_os.path.dirname(__file__), "..", "..", "frontend", "dist"))
+# ---------------- 后台管理 ----------------
+@app.get("/api/admin/stats")
+def admin_stats():
+    def cnt(sql):
+        r = db.query_one(sql)
+        return r["c"] if r else 0
+    return {
+        "projects": cnt("SELECT count(*) c FROM projects"),
+        "assets": cnt("SELECT count(*) c FROM assets"),
+        "models": cnt("SELECT count(*) c FROM model_registry"),
+        "providers": cnt("SELECT count(*) c FROM providers"),
+        "runs": cnt("SELECT count(*) c FROM node_runs"),
+        "audits": cnt("SELECT count(*) c FROM audit_events"),
+    }
+
+
+@app.get("/api/assets")
+def list_all_assets():
+    return db.query("SELECT id, project_id, role, mime, width, height, created_at, source FROM assets ORDER BY created_at DESC LIMIT 200")
+
+
+@app.delete("/api/assets/{aid}")
+def delete_asset(aid: str):
+    a = db.query_one("SELECT object_key FROM assets WHERE id=?", (aid,))
+    if not a:
+        raise HTTPException(404, "素材不存在")
+    try:
+        storage.delete(a["object_key"])
+    except Exception:
+        pass
+    db.execute("DELETE FROM assets WHERE id=?", (aid,))
+    return {"ok": True}
+
+
+@app.get("/api/runs")
+def list_runs():
+    return db.query("SELECT id,node_id,model_id,status,started_at,ended_at,error_code FROM node_runs ORDER BY started_at DESC LIMIT 50")
+
+
+@app.get("/api/audit")
+def list_audit():
+    return db.query("SELECT * FROM audit_events ORDER BY time DESC LIMIT 100")
+
+
 if _os.path.isdir(_DIST):
     from fastapi.staticfiles import StaticFiles
     app.mount("/", StaticFiles(directory=_DIST, html=True), name="static")

@@ -52,6 +52,11 @@ export const api = {
   deleteNode: (nid: string) => fetch(`${BASE}/api/nodes/${nid}`, { method: 'DELETE' }).then(j<any>),
 
   listProviders: () => fetch(`${BASE}/api/providers`).then(j<Provider[]>),
+  adminStats: () => fetch(`${BASE}/api/admin/stats`).then(j<any>),
+  listRuns: () => fetch(`${BASE}/api/runs`).then(j<any[]>),
+  listAudit: () => fetch(`${BASE}/api/audit`).then(j<any[]>),
+  listAllAssets: () => fetch(`${BASE}/api/assets`).then(j<any[]>),
+  deleteAsset: (aid: string) => fetch(`${BASE}/api/assets/${aid}`, { method: 'DELETE' }).then(j<any>),
   createProvider: (body: any) =>
     fetch(`${BASE}/api/providers`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<Provider>),
   updateProvider: (id: string, body: any) =>

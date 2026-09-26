@@ -143,6 +143,7 @@ function WBNodeComp({ data, selected }: { data: RFNodeData; selected?: boolean }
     </div>
   )
 }
+const SKELETON_LABEL: Record<string, string> = { poster: '海报', long: '长图', detail: '详情页', cover: '封面', illustration: '插图' }
 const NODE_PALETTE = [
   { type: 'product_facts', label: '产品事实' },
   { type: 'product_image', label: '产品图' },
@@ -379,6 +380,12 @@ export default function App({ templateName, skeleton, onBack }: { templateName?:
       <div className="body">
         <LeftNav onBack={onBack} onAddNode={addNode} onRun={runAll} onModels={() => setShowModelMgr(true)} />
         <div className="sidebar">
+          {templateName && (
+            <div className="tpl-banner">
+              <div className="tpl-banner-name">{templateName}</div>
+              <div className="tpl-banner-sub">{skeleton ? (SKELETON_LABEL[skeleton] || skeleton) : '通用'}工作流</div>
+            </div>
+          )}
           <h3>项目</h3>
           {projects.map((p) => (
             <div key={p.id} className={`proj-item ${p.id === pid ? 'active' : ''}`} onClick={() => setPid(p.id)}

@@ -45,9 +45,11 @@ const RATIO: Record<AspectRatio, string> = { free: '4 / 3', '16:9': '16 / 9', '4
 interface Props {
   onUse: (t: Template) => void
   onWorkflow: () => void
+  onDesign: () => void
+  onAdmin: () => void
 }
 
-export default function Gallery({ onUse, onWorkflow }: Props) {
+export default function Gallery({ onUse, onWorkflow, onDesign, onAdmin }: Props) {
   const [level, setLevel] = useState('marketing')
   const [sub, setSub] = useState('')
 
@@ -62,6 +64,8 @@ export default function Gallery({ onUse, onWorkflow }: Props) {
           <p>面向行业企业的终端获客物料。选择模版开始，或进入节点式生图工作流。</p>
         </div>
         <button className="btn primary" onClick={onWorkflow}>进入生图工作流</button>
+        <button className="btn" onClick={onDesign}>自由设计画布</button>
+        <button className="btn" onClick={onAdmin}>后台管理</button>
       </header>
 
       <div className="level-tabs">
