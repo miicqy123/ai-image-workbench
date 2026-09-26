@@ -15,6 +15,7 @@ const TABS = [
   { key: 'models', label: '模型 / 服务商' },
   { key: 'usage', label: '用量与成本' },
   { key: 'quota', label: '额度与组织' },
+  { key: 'reviews', label: '审核中心' },
 ] as const
 
 export default function Admin({ onBack }: { onBack: () => void }) {
@@ -31,7 +32,10 @@ export default function Admin({ onBack }: { onBack: () => void }) {
   const [cost, setCost] = useState<any>(null)
   const [orgs, setOrgs] = useState<any[]>([])
   const [ledger, setLedger] = useState<any[]>([])
-  const [tab, setTab] = useState<'projects' | 'runs' | 'audit' | 'models' | 'assets' | 'templates' | 'prompts' | 'usage' | 'quota'>('projects')
+  const [reviews, setReviews] = useState<any[]>([])
+  const [reviewFilter, setReviewFilter] = useState('pending')
+  const [reviewDetail, setReviewDetail] = useState<any>(null)
+  const [tab, setTab] = useState<'projects' | 'runs' | 'audit' | 'models' | 'assets' | 'templates' | 'prompts' | 'usage' | 'quota' | 'reviews'>('projects')
   const [showModels, setShowModels] = useState(false)
 
   const refresh = async () => {
@@ -48,6 +52,7 @@ export default function Admin({ onBack }: { onBack: () => void }) {
     setCost(await api.adminCostSummary(30))
     setOrgs(await api.adminOrganizations())
     setLedger(await api.adminCreditLedger())
+    setReviews(await api.adminReviews(reviewFilter ? `?status=${reviewFilter}` : ''))
   }
   useEffect(() => { refresh() }, [])
 
@@ -140,10 +145,11 @@ export default function Admin({ onBack }: { onBack: () => void }) {
               <button className="btn primary" onClick={async () => { const name = prompt('模板名称'); if (!name) return; const l2 = prompt('二级分类（如 营销｜品牌海报）') || ''; const sk = prompt('工作流骨架 poster/long/detail/cover/illustration', 'poster') || 'poster'; await api.createTemplate({ name, level2: l2, skeleton: sk }); refresh() }}>+ 新增模板</button>
             </div>
             <table className="admin-table">
-              <thead><tr><th>名称</th><th>一级</th><th>二级</th><th>骨架</th><th>比例</th><th>状态</th><th>操作</th></tr></thead>
+              <thead><tr><th>名称</th><th>一级</th><th>二级</th><th>骨架</th><th>比例</th><th>状态</th><th>导出前审核</th><th>操作</th></tr></thead>
               <tbody>{templates.map((t) => (
                 <tr key={t.id}><td>{t.name}</td><td>{t.level1}</td><td>{t.level2}</td><td>{t.skeleton}</td><td>{t.aspect}</td>
                   <td>{t.enabled ? '启用' : '停用'}</td>
+                  <td><button className="btn" onClick={async () => { await api.patchTemplate(t.id, { require_review: t.require_review ? 0 : 1 }); refresh() }}>{t.require_review ? '需要' : '不需要'}</button></td>
                   <td><button className="btn danger" onClick={async () => { if (confirm('删除该模板？')) { await api.deleteTemplate(t.id); refresh() } }}>删除</button></td></tr>
               ))}</tbody>
             </table>
@@ -317,6 +323,60 @@ export default function Admin({ onBack }: { onBack: () => void }) {
             </table>
           </div>
         )}
+        {tab === 'reviews' && (
+          <div>
+            <div className="admin-models-head">
+              <h2>审核中心（{reviews.length}）</h2>
+              <div>
+                {['pending', 'in_review', 'approved', 'returned', 'rejected', ''].map((f) => (
+                  <button key={f || 'all'} className={`tag-chip ${reviewFilter === f ? 'on' : ''}`}
+                    onClick={async () => { setReviewFilter(f); setReviews(await api.adminReviews(f ? `?status=${f}` : '')) }}>
+                    {({ pending: '待审核', in_review: '审核中', approved: '已通过', returned: '已退回', rejected: '已拒绝', '': '全部' } as Record<string, string>)[f] || f}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <table className="admin-table">
+              <thead><tr><th>提交时间</th><th>项目</th><th>审核对象</th><th>风险</th><th>命中规则</th><th>状态</th><th>操作</th></tr></thead>
+              <tbody>
+                {reviews.map((r) => (
+                  <tr key={r.id}>
+                    <td>{new Date(r.created_at * 1000).toLocaleString()}</td>
+                    <td>{r.project_name}</td>
+                    <td>{r.target_label}</td>
+                    <td><span className={`run-tag ${r.risk_level === 'high' ? 'run-failed' : r.risk_level === 'medium' ? 'run-running' : 'run-succeeded'}`}>{r.risk_level}</span></td>
+                    <td>{(r.hits || []).map((h: any) => h.name).join('、') || '—'}</td>
+                    <td><span className="run-tag">{r.status}</span></td>
+                    <td>
+                      <button className="btn" onClick={async () => setReviewDetail(await api.adminReviewDetail(r.id))}>详情</button>
+                      {r.status !== 'approved' && <button className="btn primary" onClick={async () => { await api.reviewApprove(r.id, {}); refresh() }}>通过</button>}
+                      {r.status !== 'returned' && <button className="btn" onClick={async () => { const reason = prompt('退回原因（必填，将通知提交人）'); if (!reason) return; await api.reviewReturn(r.id, { reason }); refresh() }}>退回</button>}
+                      {r.status !== 'rejected' && <button className="btn danger" onClick={async () => { const reason = prompt('拒绝原因（必填）'); if (!reason) return; await api.reviewReject(r.id, { reason }); refresh() }}>拒绝</button>}
+                    </td>
+                  </tr>
+                ))}
+                {!reviews.length && <tr><td colSpan={7} className="muted">当前筛选下没有审核记录。</td></tr>}
+              </tbody>
+            </table>
+            {reviewDetail && (
+              <div className="card-soft" style={{ marginTop: 12 }}>
+                <div><b>{reviewDetail.title}</b> · {reviewDetail.status} · 风险 {reviewDetail.risk_level}</div>
+                <div className="line">提交人：{reviewDetail.submitted_by}；审核人：{reviewDetail.decided_by || '—'}；原因：{reviewDetail.reason || '—'}</div>
+                <div className="line" style={{ marginTop: 6 }}><b>规则清单</b></div>
+                <div className="line">{(reviewDetail.checklist || []).map((c: any) => `${c.name}${c.hit ? '（命中）' : ''}`).join(' · ')}</div>
+                <div className="line" style={{ marginTop: 6 }}><b>命中的表述</b></div>
+                <div className="line">{(reviewDetail.hits || []).length ? (reviewDetail.hits || []).map((h: any) => `${h.name}: ${(h.matched || []).join('、')}`).join(' ｜ ') : '未命中规则关键词'}</div>
+                <div className="line" style={{ marginTop: 6 }}><b>送审文本</b></div>
+                {Object.entries(reviewDetail.project_texts || {}).map(([k, v]) => (
+                  <div className="line" key={k}><span className="muted">{k}：</span>{String(v).slice(0, 300)}</div>
+                ))}
+                <div className="muted" style={{ marginTop: 6 }}>规则初筛只覆盖文本关键词，不代表合规结论，也不做图像识别。</div>
+                <button className="btn" style={{ marginTop: 8 }} onClick={() => setReviewDetail(null)}>关闭详情</button>
+              </div>
+            )}
+          </div>
+        )}
+
       </div>
 
       {showModels && <ModelManager models={models} onClose={() => setShowModels(false)} onChanged={refresh} showToast={() => {}} />}

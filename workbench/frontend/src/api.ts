@@ -12,8 +12,8 @@ async function j<T>(res: Response): Promise<T> {
 
 export const api = {
   listProjects: () => fetch(`${BASE}/api/projects`).then(j<any[]>),
-  createProject: (name: string) =>
-    fetch(`${BASE}/api/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).then(j<any>),
+  createProject: (name: string, templateId?: string) =>
+    fetch(`${BASE}/api/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, template_id: templateId || null }) }).then(j<any>),
   renameProject: (id: string, name: string) =>
     fetch(`${BASE}/api/projects/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).then(j<any>),
   deleteProject: (id: string) => fetch(`${BASE}/api/projects/${id}`, { method: 'DELETE' }).then(j<any>),
@@ -100,10 +100,26 @@ export const api = {
   deductCredits: (body: any) => fetch(`${BASE}/api/admin/credits/deduct`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
   refundCredits: (body: any) => fetch(`${BASE}/api/admin/credits/refund`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
   setModelPricing: (modelId: string, unit_cost: number) => fetch(`${BASE}/api/admin/models/${modelId}/pricing`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ unit_cost }) }).then(j<any>),
+  complianceRules: () => fetch(`${BASE}/api/compliance/rules`).then(j<any>),
+  complianceScan: (body: any) => fetch(`${BASE}/api/compliance/scan`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  createReview: (pid: string, body: any) => fetch(`${BASE}/api/projects/${pid}/reviews`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  listProjectReviews: (pid: string) => fetch(`${BASE}/api/projects/${pid}/reviews`).then(j<any[]>),
+  reviewGate: (pid: string) => fetch(`${BASE}/api/projects/${pid}/review-gate`).then(j<any>),
+  projectComplianceScan: (pid: string) => fetch(`${BASE}/api/projects/${pid}/compliance-scan`).then(j<any>),
+  adminReviews: (q = '') => fetch(`${BASE}/api/admin/reviews${q}`).then(j<any[]>),
+  adminReviewDetail: (rid: string) => fetch(`${BASE}/api/admin/reviews/${rid}`).then(j<any>),
+  reviewApprove: (rid: string, body: any = {}) => fetch(`${BASE}/api/admin/reviews/${rid}/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  reviewReturn: (rid: string, body: any) => fetch(`${BASE}/api/admin/reviews/${rid}/return`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  reviewReject: (rid: string, body: any) => fetch(`${BASE}/api/admin/reviews/${rid}/reject`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
+  reviewClaim: (rid: string) => fetch(`${BASE}/api/admin/reviews/${rid}/claim`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }).then(j<any>),
+  notifications: () => fetch(`${BASE}/api/creator/notifications`).then(j<any>),
+  readNotification: (nid: string) => fetch(`${BASE}/api/creator/notifications/${nid}/read`, { method: 'POST' }).then(j<any>),
+  readAllNotifications: () => fetch(`${BASE}/api/creator/notifications/read-all`, { method: 'POST' }).then(j<any>),
   listTemplates: () => fetch(`${BASE}/api/templates`).then(j<any[]>),
   adminTemplates: () => fetch(`${BASE}/api/admin/templates`).then(j<any[]>),
   createTemplate: (body: any) => fetch(`${BASE}/api/admin/templates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
   deleteTemplate: (id: string) => fetch(`${BASE}/api/admin/templates/${id}`, { method: 'DELETE' }).then(j<any>),
+  patchTemplate: (id: string, body: any) => fetch(`${BASE}/api/admin/templates/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
   listPromptTemplates: () => fetch(`${BASE}/api/admin/prompt-templates`).then(j<any[]>),
   createPromptTemplate: (body: any) => fetch(`${BASE}/api/admin/prompt-templates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j<any>),
   deletePromptTemplate: (id: string) => fetch(`${BASE}/api/admin/prompt-templates/${id}`, { method: 'DELETE' }).then(j<any>),

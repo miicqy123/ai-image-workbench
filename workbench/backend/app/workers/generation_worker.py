@@ -7,6 +7,7 @@ import time
 from .. import db, registry, storage
 from ..generators import image as image_gen
 from ..services import metering
+from ..services import notify as notify_svc
 
 
 def _claim_one():
@@ -78,6 +79,11 @@ def run_once():
                               input_images=info["input_images"], width=info["width"], height=info["height"],
                               duration_ms=int((db.now() - started) * 1000),
                               status="succeeded", job_id=job["id"], user_id=job.get("user_id") or "usr_default")
+        proj_name = (db.query_one("SELECT name FROM projects WHERE id=?", (job["project_id"],)) or {}).get("name") or job["project_id"]
+        notify_svc.notify(job.get("user_id") or "usr_default", "job",
+                          f"生图任务已完成：{proj_name}",
+                          f"任务 {job['id']} 产出 {info['count']} 张候选图",
+                          ref_type="job", ref_id=job["id"])
     except Exception as e:
         db.execute("UPDATE generation_jobs SET status='failed', error_code=?, error_message=?, finished_at=? WHERE id=?",
                    (type(e).__name__, str(e)[:300], int(db.now()), job["id"]))
@@ -86,6 +92,11 @@ def run_once():
                                   task_type=job["task_type"], output_images=0,
                                   duration_ms=int((db.now() - started) * 1000),
                                   status="failed", job_id=job["id"], user_id=job.get("user_id") or "usr_default")
+            proj_name = (db.query_one("SELECT name FROM projects WHERE id=?", (job["project_id"],)) or {}).get("name") or job["project_id"]
+            notify_svc.notify(job.get("user_id") or "usr_default", "job",
+                              f"生图任务失败：{proj_name}",
+                              f"任务 {job['id']} 失败：{str(e)[:160]}",
+                              ref_type="job", ref_id=job["id"])
         except Exception:
             pass
     return True

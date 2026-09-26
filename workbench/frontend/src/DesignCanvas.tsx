@@ -37,6 +37,9 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
   const [pendingSticky, setPendingSticky] = useState<string | null>(null)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [showExport, setShowExport] = useState(false)
+  const [reviewGate, setReviewGate] = useState<any>(null)
+  const [reviewScan, setReviewScan] = useState<any>(null)
+  const [reviews, setReviews] = useState<any[]>([])
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([])
@@ -152,6 +155,30 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
     return null
   }).filter(Boolean)
 
+  const refreshReviews = async (pid: string) => {
+    try {
+      setReviews(await api.listProjectReviews(pid))
+      setReviewGate(await api.reviewGate(pid))
+    } catch { /* 忽略 */ }
+  }
+
+  const scanProject = async () => {
+    if (!projectId) { notify('请先点「生成」创建项目'); return }
+    try { setReviewScan(await api.projectComplianceScan(projectId)); setShowExport(true) }
+    catch (e: any) { notify('初筛失败：' + (e?.message || e)) }
+  }
+
+  const submitReview = async () => {
+    if (!projectId) { notify('请先点「生成」创建项目'); return }
+    try {
+      await api.putCanvas(projectId, { width: size.w, height: size.h, document: { version: 1, width: size.w, height: size.h, layers: toLayers() } })
+      const r = await api.createReview(projectId, { target_type: 'canvas_output', summary: '画布成品送审' })
+      setReviewScan({ risk_level: r.risk_level, hits: r.hits, fields: {} })
+      await refreshReviews(projectId)
+      notify(`已提交审核（风险等级：${r.risk_level}）`)
+    } catch (e: any) { notify('提交审核失败：' + (e?.message || e)) }
+  }
+
   const exportCanvasPng = async () => {
     if (!projectId) { notify('请先点「生成」创建项目'); return }
     try {
@@ -167,8 +194,9 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
     setWorkflow({ stages: WORKFLOW_STAGES.map((s, i) => ({ id: 's' + i, label: s, status: i === 0 ? 'active' : 'pending' })), current: 0 })
     const mark = (idx: number) => setWorkflow((w) => w ? { ...w, current: idx, stages: w.stages.map((s, i) => ({ ...s, status: i < idx ? 'done' : i === idx ? 'active' : 'pending' })) } : w)
     try {
-      const p = await api.createProject(template.name + (opts.platform ? ' · ' + opts.platform : ''))
+      const p = await api.createProject(template.name + (opts.platform ? ' · ' + opts.platform : ''), template.id)
       setProjectId(p.id)
+      await refreshReviews(p.id)
       await api.initTemplate(p.id, template.skeleton || 'poster')
       let uploaded: string[] = []
       for (const f of uploadedFiles) {
@@ -309,8 +337,42 @@ export default function DesignCanvas({ template, onBack }: { template: Template;
                   <div className="mm-form-actions">
                     <button className="btn primary" onClick={() => generatedAssets.forEach((aid, i) => download(fileUrl(aid), `${template.name}_${i + 1}.png`))}>下载全部</button>
                     <button className="btn primary" onClick={exportCanvasPng}>导出画布 PNG（含图层）</button>
+                    <button className="btn" onClick={scanProject}>合规初筛</button>
+                    <button className="btn" onClick={submitReview}>提交审核</button>
                     <button className="btn" onClick={() => setShowExport(false)}>关闭</button>
                   </div>
+                  {reviewGate && !reviewGate.ok && (
+                    <div className="card-soft" style={{ marginTop: 10 }}>
+                      <b>导出前审核</b>
+                      <div className="line">
+                        {reviewGate.reason === 'pending_review' && '该项目有未完成的审核，需在后台审核中心处理后才可导出。'}
+                        {reviewGate.reason === 'review_required' && `模板「${reviewGate.template || ''}」要求导出前审核，请先提交审核并通过。`}
+                        {reviewGate.reason === 'stale_approval' && '成品在审核通过后又做了修改，需要重新提交审核。'}
+                      </div>
+                    </div>
+                  )}
+                  {reviewGate && reviewGate.ok && reviews.some((r) => r.status === 'approved') && (
+                    <div className="muted" style={{ marginTop: 8 }}>当前成品已通过审核，可正常导出。</div>
+                  )}
+                  {reviewScan && (
+                    <div className="card-soft" style={{ marginTop: 10 }}>
+                      <b>合规初筛（规则关键词，非合规结论）</b>
+                      <div className="line">风险等级：{reviewScan.risk_level}</div>
+                      <div className="line">
+                        {(reviewScan.hits || []).length
+                          ? reviewScan.hits.map((h: any) => `${h.name}：${(h.matched || []).join('、')}`).join(' ｜ ')
+                          : '未命中规则关键词'}
+                      </div>
+                    </div>
+                  )}
+                  {reviews.length > 0 && (
+                    <div className="card-soft" style={{ marginTop: 10 }}>
+                      <b>本项目审核记录</b>
+                      {reviews.map((r) => (
+                        <div className="line" key={r.id}>{r.target_label} · {r.status} · 风险 {r.risk_level}{r.reason ? ` · ${r.reason}` : ''}</div>
+                      ))}
+                    </div>
+                  )}
                 </>
               )}
             </div>

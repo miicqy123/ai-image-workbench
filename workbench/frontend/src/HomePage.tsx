@@ -7,8 +7,10 @@ const L: Record<string, string> = { draft: '草稿', generating: '生成中', co
 export default function HomePage({ onQuickCreate, onProjects }: { onQuickCreate: () => void; onProjects: () => void }) {
   const [d, setD] = useState<any>(null)
   const [u, setU] = useState<any>(null)
+  const [ntf, setNtf] = useState<any>(null)
   useEffect(() => { api.creatorDashboard().then(setD).catch(() => setD(null)) }, [])
   useEffect(() => { api.creatorUsageSummary().then(setU).catch(() => setU(null)) }, [])
+  useEffect(() => { api.notifications().then(setNtf).catch(() => setNtf(null)) }, [])
   return (
     <div className="page">
       <header className="page-head"><h1>我的工作台</h1><button className="btn primary" onClick={onQuickCreate}>+ 新建创作</button></header>
@@ -28,6 +30,21 @@ export default function HomePage({ onQuickCreate, onProjects }: { onQuickCreate:
       </div>
       <h2 className="page-sub">快速创建</h2>
       <div className="quick-grid">{QUICK.map((q) => <button key={q} className="quick-card" onClick={onQuickCreate}>{q}</button>)}</div>
+      <h2 className="page-sub">
+        通知{ntf?.unread ? `（${ntf.unread} 条未读）` : ''}
+        {ntf?.unread ? <button className="btn" onClick={async () => { await api.readAllNotifications(); setNtf(await api.notifications()) }}>全部标记已读</button> : null}
+      </h2>
+      <div className="proj-list">
+        {(ntf?.items || []).slice(0, 5).map((n: any) => (
+          <div className="proj-row" key={n.id}>
+            <span className={`run-tag run-${n.type === 'review' ? 'running' : 'succeeded'}`}>{n.type === 'review' ? '审核' : '任务'}</span>
+            <span className="proj-row-name">{n.title}</span>
+            <span className="muted">{n.body}</span>
+            {!n.read && <button className="btn" onClick={async () => { await api.readNotification(n.id); setNtf(await api.notifications()) }}>标记已读</button>}
+          </div>
+        ))}
+        {!(ntf?.items || []).length && <div className="muted">暂无通知。</div>}
+      </div>
       <h2 className="page-sub">最近项目 <button className="btn" onClick={onProjects}>全部项目</button></h2>
       <div className="proj-list">
         {(d?.recent || []).map((p: any) => (

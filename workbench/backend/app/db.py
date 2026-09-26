@@ -155,6 +155,21 @@ CREATE TABLE IF NOT EXISTS credit_ledger (
     ref_type TEXT, ref_id TEXT, created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_org ON credit_ledger(organization_id);
+CREATE TABLE IF NOT EXISTS reviews (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, target_type TEXT NOT NULL,
+    asset_id TEXT, target_ref TEXT, title TEXT, summary TEXT,
+    status TEXT NOT NULL DEFAULT 'pending', risk_level TEXT NOT NULL DEFAULT 'low',
+    checklist_json TEXT NOT NULL DEFAULT '[]', hits_json TEXT NOT NULL DEFAULT '[]',
+    reason TEXT, submitted_by TEXT, assigned_to TEXT, decided_by TEXT, decided_at INTEGER,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
+CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id);
+CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY, user_id TEXT, type TEXT NOT NULL, title TEXT NOT NULL, body TEXT,
+    ref_type TEXT, ref_id TEXT, read INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
 """
 
 
@@ -194,6 +209,8 @@ def init_db() -> None:
         for col, ctype in [("default_text_model", "TEXT"), ("default_image_model", "TEXT")]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE projects ADD COLUMN {col} {ctype}")
+        if "template_id" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN template_id TEXT")
         mcols = [r["name"] for r in conn.execute("PRAGMA table_info(model_registry)")]
         for col in ("provider_id", "adapter"):
             if col not in mcols:
@@ -209,6 +226,10 @@ def init_db() -> None:
         mcols3 = [r["name"] for r in conn.execute("PRAGMA table_info(model_registry)")]
         if "unit_cost" not in mcols3:
             conn.execute("ALTER TABLE model_registry ADD COLUMN unit_cost REAL NOT NULL DEFAULT 0")
+        conn.commit()
+        tcols = [r["name"] for r in conn.execute("PRAGMA table_info(templates)")]
+        if "require_review" not in tcols:
+            conn.execute("ALTER TABLE templates ADD COLUMN require_review INTEGER NOT NULL DEFAULT 0")
         conn.commit()
         # 默认组织与初始额度（单机演示；生产应做真实计费与隔离）
         conn.execute("INSERT OR IGNORE INTO organizations(id,name,plan,credit_balance,quota_total,daily_limit,period_start,created_at) "

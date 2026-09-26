@@ -26,6 +26,8 @@ from .services import canvas_renderer
 from .services import model_router
 from .services import prompt_compiler
 from .services import metering
+from .services import compliance
+from .services import notify as notify_svc
 
 app = FastAPI(title="AI 多节点产品营销生图工作台", version="0.1.0")
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
@@ -152,6 +154,7 @@ def mark_stale(node_id):
 class ProjectCreate(BaseModel):
     name: str
     tenant_id: str = "tnt_default"
+    template_id: Optional[str] = None
 
 
 @app.get("/api/health")
@@ -162,8 +165,8 @@ def health():
 @app.post("/api/projects")
 def create_project(body: ProjectCreate):
     pid = db.gen_id("prj")
-    db.execute("INSERT INTO projects(id,tenant_id,owner_id,name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-               (pid, body.tenant_id, "usr_default", body.name, "active", db.now(), db.now()))
+    db.execute("INSERT INTO projects(id,tenant_id,owner_id,name,status,template_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+               (pid, body.tenant_id, "usr_default", body.name, "active", body.template_id, db.now(), db.now()))
     gid = db.gen_id("grf")
     db.execute("INSERT INTO graphs(id,project_id,current_version) VALUES(?,?,1)", (gid, pid))
     return {"id": pid, "name": body.name, "graph_id": gid}
@@ -387,7 +390,7 @@ def seed_templates():
 @app.get("/api/templates")
 def list_templates():
     seed_templates()
-    return db.query("SELECT id,name,subtitle,level1,level2,skeleton,aspect,accent,enabled FROM templates WHERE enabled=1 ORDER BY created_at ASC")
+    return db.query("SELECT id,name,subtitle,level1,level2,skeleton,aspect,accent,enabled,require_review FROM templates WHERE enabled=1 ORDER BY created_at ASC")
 
 
 class TemplateIn(BaseModel):
@@ -424,6 +427,34 @@ def admin_update_template(tid: str, body: TemplateIn):
         raise HTTPException(404, "模板不存在")
     db.execute("UPDATE templates SET name=?,subtitle=?,level1=?,level2=?,skeleton=?,aspect=?,accent=?,enabled=? WHERE id=?",
                (body.name, body.subtitle, body.level1, body.level2, body.skeleton, body.aspect, body.accent, int(body.enabled), tid))
+    return db.query_one("SELECT * FROM templates WHERE id=?", (tid,))
+
+
+class TemplatePatch(BaseModel):
+    name: Optional[str] = None
+    subtitle: Optional[str] = None
+    level1: Optional[str] = None
+    level2: Optional[str] = None
+    skeleton: Optional[str] = None
+    aspect: Optional[str] = None
+    accent: Optional[str] = None
+    enabled: Optional[int] = None
+    require_review: Optional[int] = None
+
+
+@app.patch("/api/admin/templates/{tid}")
+def admin_patch_template(tid: str, body: TemplatePatch):
+    if not db.query_one("SELECT id FROM templates WHERE id=?", (tid,)):
+        raise HTTPException(404, "模板不存在")
+    cols = ("name", "subtitle", "level1", "level2", "skeleton", "aspect", "accent", "enabled", "require_review")
+    fields, args = [], []
+    for c in cols:
+        v = getattr(body, c)
+        if v is not None:
+            fields.append(f"{c}=?"); args.append(int(v) if c in ("enabled", "require_review") else v)
+    if fields:
+        db.execute(f"UPDATE templates SET {','.join(fields)} WHERE id=?", tuple(args) + (tid,))
+        db.audit(None, "usr_default", "template.update", tid)
     return db.query_one("SELECT * FROM templates WHERE id=?", (tid,))
 
 
@@ -640,11 +671,17 @@ def put_canvas(pid: str, body: CanvasIn):
         cid = db.gen_id("cvs")
         db.execute("INSERT INTO canvas_documents(id,project_id,candidate_id,width,height,canvas_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                    (cid, pid, body.candidate_id, body.width, body.height, doc_json, now, now))
-    return {"ok": True, "id": cid}
+    approved = db.query("SELECT id,title FROM reviews WHERE project_id=? AND status='approved'", (pid,))
+    for rv in approved:
+        db.execute("UPDATE reviews SET status='pending', reason=?, updated_at=? WHERE id=?",
+                   ("成品已修改，需重新审核", int(db.now()), rv["id"]))
+        notify("usr_default", "review", f"需重新审核：{rv['title']}", "画布成品在审核通过后被修改", ref_type="review", ref_id=rv["id"])
+    return {"ok": True, "id": cid, "reopened_reviews": [r["id"] for r in approved]}
 
 
 @app.post("/api/projects/{pid}/canvas/export")
 def export_canvas(pid: str):
+    _review_gate(pid, raise_error=True)
     r = db.query_one("SELECT * FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
     if not r:
         raise HTTPException(422, "请先保存画布")
@@ -669,7 +706,12 @@ def export_canvas(pid: str):
                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (aid, "tnt_default", pid, "image", "export", obj_key, "", "image/png",
                 int(doc.get("width") or 768), int(doc.get("height") or 1024), db.now(), "canvas_export", "manual", "exported"))
-    return {"asset_id": aid, "download_url": f"/files/{aid}"}
+    # 审核通过记录绑定成品 Asset，便于追溯「哪一版成品被谁在何时放行」
+    ap = db.query_one("SELECT id FROM reviews WHERE project_id=? AND status='approved' ORDER BY decided_at DESC LIMIT 1", (pid,))
+    if ap:
+        db.execute("UPDATE reviews SET asset_id=?, target_ref=?, updated_at=? WHERE id=?",
+                   (aid, aid, int(db.now()), ap["id"]))
+    return {"asset_id": aid, "download_url": f"/files/{aid}", "review_id": (ap or {}).get("id")}
 
 
 # ---------------- assets ----------------
@@ -1911,6 +1953,209 @@ def creator_usage_records(days: int = 30, limit: int = 100):
     return db.query("SELECT id,project_id,model_id,task_type,output_images,cost,status,created_at "
                     "FROM usage_records WHERE created_at>=? ORDER BY created_at DESC LIMIT ?",
                     (since, int(limit)))
+
+
+# ---------------- 审核与合规中心（模块 J）+ 站内通知 ----------------
+REVIEW_STATUS = ["not_required", "pending", "in_review", "approved", "returned", "rejected"]
+
+
+class ReviewIn(BaseModel):
+    target_type: str = "canvas_output"
+    asset_id: Optional[str] = None
+    target_ref: Optional[str] = None
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ReviewDecisionIn(BaseModel):
+    reason: str = ""
+    assigned_to: Optional[str] = None
+
+
+class ScanIn(BaseModel):
+    text: Optional[str] = None
+    texts: Optional[dict] = None
+
+
+notify = notify_svc.notify
+
+
+def _review_public(r: dict) -> dict:
+    return {**r,
+            "checklist": json_loads(r.get("checklist_json"), []),
+            "hits": json_loads(r.get("hits_json"), []),
+            "target_label": compliance.TARGET_LABELS.get(r["target_type"], r["target_type"])}
+
+
+@app.get("/api/compliance/rules")
+def compliance_rules():
+    return {"rules": compliance.rules(), "target_types":
+            [{"code": t, "label": compliance.TARGET_LABELS.get(t, t)} for t in compliance.TARGET_TYPES],
+            "statuses": REVIEW_STATUS,
+            "disclaimer": "规则初筛只针对文本关键词，不等价于合规结论，也不做图像识别；最终以人工审核为准。"}
+
+
+@app.post("/api/compliance/scan")
+def compliance_scan(body: ScanIn):
+    if body.texts:
+        return compliance.scan_many(body.texts)
+    return compliance.scan_text(body.text or "")
+
+
+def _review_gate(pid: str, raise_error: bool = True):
+    """导出前审核门禁：未完成的审核或高要求模板未通过审核时拦截导出。"""
+    pending = db.query_one("SELECT id,status FROM reviews WHERE project_id=? AND status IN ('pending','in_review') LIMIT 1", (pid,))
+    if pending:
+        if raise_error:
+            raise HTTPException(409, "该项目有未完成的审核，请先到「审核中心」处理后再导出")
+        return {"ok": False, "reason": "pending_review", "review_id": pending["id"]}
+    proj = db.query_one("SELECT template_id FROM projects WHERE id=?", (pid,)) or {}
+    if proj.get("template_id"):
+        tpl = db.query_one("SELECT id,name,require_review FROM templates WHERE id=?", (proj["template_id"],)) or {}
+        if tpl.get("require_review"):
+            ok = db.query_one("SELECT id,decided_at FROM reviews WHERE project_id=? AND status='approved' ORDER BY decided_at DESC LIMIT 1", (pid,))
+            if not ok:
+                if raise_error:
+                    raise HTTPException(409, "该模板要求导出前审核，请先提交审核并通过")
+                return {"ok": False, "reason": "review_required", "template": tpl.get("name")}
+            latest = db.query_one("SELECT updated_at FROM canvas_documents WHERE project_id=? ORDER BY updated_at DESC LIMIT 1", (pid,))
+            if latest and ok.get("decided_at") and latest["updated_at"] > ok["decided_at"]:
+                if raise_error:
+                    raise HTTPException(409, "成品在审核通过后又做了修改，需要重新提交审核")
+                return {"ok": False, "reason": "stale_approval", "review_id": ok["id"]}
+    return {"ok": True}
+
+
+@app.get("/api/projects/{pid}/compliance-scan")
+def project_compliance_scan(pid: str):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    return compliance.scan_many(compliance.project_texts(pid, db))
+
+
+@app.get("/api/projects/{pid}/review-gate")
+def project_review_gate(pid: str):
+    return _review_gate(pid, raise_error=False)
+
+
+@app.post("/api/projects/{pid}/reviews", status_code=201)
+def create_review(pid: str, body: ReviewIn):
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "项目不存在")
+    if body.target_type not in compliance.TARGET_TYPES:
+        raise HTTPException(422, f"不支持审核对象类型 {body.target_type}")
+    scanned = compliance.scan_many(compliance.project_texts(pid, db))
+    title = body.title or f"{(db.query_one('SELECT name FROM projects WHERE id=?', (pid,)) or {}).get('name') or pid} · {compliance.TARGET_LABELS.get(body.target_type, body.target_type)}"
+    rid = db.gen_id("rev")
+    now = int(db.now())
+    db.execute("INSERT INTO reviews(id,project_id,target_type,asset_id,target_ref,title,summary,status,risk_level,"
+               "checklist_json,hits_json,reason,submitted_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (rid, pid, body.target_type, body.asset_id, body.target_ref or "",
+                title, body.summary or body.note or "", "pending", scanned["risk_level"],
+                json.dumps(scanned["checklist"], ensure_ascii=False), json.dumps(scanned["hits"], ensure_ascii=False),
+                "", "usr_default", now, now))
+    db.audit(pid, "usr_default", "review.submit", rid)
+    return _review_public(db.query_one("SELECT * FROM reviews WHERE id=?", (rid,)))
+
+
+@app.get("/api/projects/{pid}/reviews")
+def list_project_reviews(pid: str):
+    rows = db.query("SELECT * FROM reviews WHERE project_id=? ORDER BY created_at DESC", (pid,))
+    return [_review_public(r) for r in rows]
+
+
+@app.get("/api/admin/reviews")
+def admin_reviews(status: Optional[str] = None, project_id: Optional[str] = None):
+    sql, args = "SELECT * FROM reviews WHERE 1=1", []
+    if status:
+        sql += " AND status=?"; args.append(status)
+    if project_id:
+        sql += " AND project_id=?"; args.append(project_id)
+    sql += " ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, created_at DESC LIMIT 300"
+    rows = db.query(sql, tuple(args))
+    out = []
+    for r in rows:
+        d = _review_public(r)
+        p = db.query_one("SELECT name FROM projects WHERE id=?", (r["project_id"],))
+        d["project_name"] = (p or {}).get("name") or r["project_id"]
+        out.append(d)
+    return out
+
+
+@app.get("/api/admin/reviews/{rid}")
+def admin_review_detail(rid: str):
+    r = db.query_one("SELECT * FROM reviews WHERE id=?", (rid,))
+    if not r:
+        raise HTTPException(404, "审核记录不存在")
+    d = _review_public(r)
+    p = db.query_one("SELECT name FROM projects WHERE id=?", (r["project_id"],))
+    d["project_name"] = (p or {}).get("name") or r["project_id"]
+    d["project_texts"] = compliance.project_texts(r["project_id"], db)
+    return d
+
+
+def _decide_review(rid: str, status: str, reason: str, assigned_to: Optional[str] = None):
+    r = db.query_one("SELECT * FROM reviews WHERE id=?", (rid,))
+    if not r:
+        raise HTTPException(404, "审核记录不存在")
+    if status == "in_review":
+        db.execute("UPDATE reviews SET status=?, assigned_to=?, updated_at=? WHERE id=?",
+                   (status, assigned_to or "usr_default", int(db.now()), rid))
+    else:
+        if status in ("returned", "rejected") and not (reason or "").strip():
+            raise HTTPException(422, "退回或拒绝必须填写原因")
+        db.execute("UPDATE reviews SET status=?, reason=?, decided_by=?, decided_at=?, assigned_to=COALESCE(?,assigned_to), updated_at=? WHERE id=?",
+                   (status, reason or "", "usr_default", int(db.now()), assigned_to, int(db.now()), rid))
+    label = {"approved": "审核通过", "returned": "审核退回", "rejected": "审核拒绝", "in_review": "已领取审核"}[status]
+    notify("usr_default", "review", f"{label}：{r['title']}", (reason or "")[:200], ref_type="review", ref_id=rid)
+    db.audit(r["project_id"], "usr_default", f"review.{status}", rid)
+    return admin_review_detail(rid)
+
+
+@app.post("/api/admin/reviews/{rid}/claim")
+def review_claim(rid: str, body: ReviewDecisionIn):
+    return _decide_review(rid, "in_review", "", body.assigned_to)
+
+
+@app.post("/api/admin/reviews/{rid}/approve")
+def review_approve(rid: str, body: ReviewDecisionIn):
+    return _decide_review(rid, "approved", body.reason, body.assigned_to)
+
+
+@app.post("/api/admin/reviews/{rid}/return")
+def review_return(rid: str, body: ReviewDecisionIn):
+    return _decide_review(rid, "returned", body.reason, body.assigned_to)
+
+
+@app.post("/api/admin/reviews/{rid}/reject")
+def review_reject(rid: str, body: ReviewDecisionIn):
+    return _decide_review(rid, "rejected", body.reason, body.assigned_to)
+
+
+@app.get("/api/creator/notifications")
+def creator_notifications(unread_only: bool = False, limit: int = 50):
+    sql = "SELECT * FROM notifications WHERE 1=1"
+    args: list = []
+    if unread_only:
+        sql += " AND read=0"
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    args.append(int(limit))
+    rows = db.query(sql, tuple(args))
+    unread = (db.query_one("SELECT count(*) c FROM notifications WHERE read=0") or {"c": 0})["c"]
+    return {"unread": unread, "items": rows}
+
+
+@app.post("/api/creator/notifications/{nid}/read")
+def read_notification(nid: str):
+    db.execute("UPDATE notifications SET read=1 WHERE id=?", (nid,))
+    return {"ok": True}
+
+
+@app.post("/api/creator/notifications/read-all")
+def read_all_notifications():
+    db.execute("UPDATE notifications SET read=1 WHERE read=0")
+    return {"ok": True}
 
 
 if _os.path.isdir(_DIST):
