@@ -113,9 +113,9 @@ export const api = {
   runImageTool: (nodeId: string, intent: string, body: any) =>
     fetch(`${BASE}/api/image-tools/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ node_id: nodeId, intent, ...body }) }).then(j<any>),
 
-  fileUrl: (assetId: string) => `${BASE}/files/${assetId}`,
+  fileUrl: (assetId: string) => `${BASE}/api/assets/${assetId}/download`,
 }
 
 export function fileUrl(assetId: string) {
-  return `${BASE}/files/${assetId}`
+  return `${BASE}/api/assets/${assetId}/download`
 }

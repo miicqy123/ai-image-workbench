@@ -34,16 +34,29 @@ app.add_middleware(
 )
 
 WB_API_TOKEN = os.environ.get("WB_API_TOKEN", "").strip()
+WB_ADMIN_TOKEN = os.environ.get("WB_ADMIN_TOKEN", "").strip()
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+ADMIN_PATH_PREFIXES = ("/api/providers", "/api/models", "/api/admin")
+
+
+def _is_admin_path(path: str) -> bool:
+    return any(path.startswith(p) for p in ADMIN_PATH_PREFIXES)
 
 
 @app.middleware("http")
 async def auth_middleware(request, call_next):
     path = request.url.path
+    if path == "/api/health":
+        return await call_next(request)
+    auth = request.headers.get("Authorization", "")
+    # 管理员接口：需 WB_ADMIN_TOKEN
+    if WB_ADMIN_TOKEN and path.startswith("/api") and _is_admin_path(path):
+        if auth != f"Bearer {WB_ADMIN_TOKEN}":
+            return JSONResponse({"detail": "需要管理员 Token"}, status_code=401)
+    # 普通接口：需 WB_API_TOKEN（管理员 Token 亦可）
     if WB_API_TOKEN and (path.startswith("/api") or path.startswith("/files")):
-        if path == "/api/health":
-            return await call_next(request)
-        if request.headers.get("Authorization", "") != f"Bearer {WB_API_TOKEN}":
+        if auth not in (f"Bearer {WB_API_TOKEN}", f"Bearer {WB_ADMIN_TOKEN}"):
             return JSONResponse({"detail": "未授权：请提供有效的 Bearer Token"}, status_code=401)
     return await call_next(request)
 
@@ -536,6 +549,17 @@ def import_text_file(pid: str, file: UploadFile = File(...)):
 @app.get("/api/projects/{pid}/assets")
 def list_assets(pid: str):
     return db.query("SELECT id,role,kind,mime,width,height,created_at,object_key FROM assets WHERE project_id=?", (pid,))
+
+
+@app.get("/api/assets/{aid}/download")
+def download_asset(aid: str):
+    a = db.query_one("SELECT * FROM assets WHERE id=?", (aid,))
+    if not a:
+        raise HTTPException(404, "资产不存在")
+    if not db.query_one("SELECT id FROM projects WHERE id=?", (a["project_id"],)):
+        raise HTTPException(404, "资产所属项目不存在，禁止访问")
+    data = storage.read_bytes(a["object_key"])
+    return Response(content=data, media_type=a["mime"] or "image/png")
 
 
 @app.get("/files/{asset_id}")
