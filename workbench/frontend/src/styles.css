@@ -404,3 +404,22 @@ body {
 .proj-row-name { flex: 1; }
 .proj-actions { display: flex; gap: 6px; }
 .run-draft { background: #E5E7EB; color: #374151; } .run-completed { background: #D1FAE5; color: #047857; } .run-generating { background: #DBEAFE; color: #1D4ED8; } .run-archived { background: #F3F4F6; color: #6B7280; }
+
+/* 工作流运行结果面板（阶段 C）：展示服务端返回的执行 / 跳过 / 失败 / 未执行 */
+.run-report { margin: 10px 12px; padding: 10px 12px; border: 1px solid var(--color-border); border-radius: 10px; background: var(--color-surface); font-size: 12px; }
+.run-report .rr-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.run-report .rr-status { padding: 6px 8px; border-radius: 6px; background: var(--color-muted-surface); margin-bottom: 6px; line-height: 1.5; }
+.run-report .rr-ok { background: #eaf7ee; color: #17663a; }
+.run-report .rr-failed { background: #fdecea; color: #97140f; }
+.run-report .rr-unsupported, .run-report .rr-unknown { background: #fff7e6; color: #8c5a00; }
+.run-report .rr-line { color: var(--color-muted-text); margin-bottom: 4px; line-height: 1.5; }
+.run-report .rr-block { margin-top: 8px; }
+.run-report .rr-title { font-weight: 600; margin-bottom: 4px; }
+.run-report .rr-item { line-height: 1.6; word-break: break-all; }
+.run-report .rr-err { color: #97140f; }
+.run-report .rr-foot { margin-top: 8px; color: var(--color-muted-text); font-size: 11px; }
+.run-bar { margin: 8px 12px 4px; }
+.run-bar .muted { line-height: 1.5; }
+.run-report .rr-running { background: #e8f1ff; color: #16436e; }
+.run-report .rr-blocked { background: #fdf0e6; color: #8a4b0a; }
+.run-report .rr-rejected { background: #fdecea; color: #97140f; }

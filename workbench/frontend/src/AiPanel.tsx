@@ -9,7 +9,9 @@ const QUICK_TASKS = [
 ]
 
 const PLATFORMS = ['淘宝/天猫', '京东', '拼多多', '抖音', '小红书', '通用']
-const RATIOS = ['1:1', '3:4', '4:3', '16:9', '9:16']
+// 只提供后端本地合成模型能力范围内的画幅（1:1 / 4:3 / 3:4 / 16:9）；
+// 后端不支持的 9:16 不再作为可提交选项，也不在此声明任何新能力
+const RATIOS = ['1:1', '3:4', '4:3', '16:9']
 
 interface Props {
   onGenerate: (opts: { count: number; platform: string; ratio: string; prompt: string; model_id?: string; template_id?: string }) => void
@@ -28,6 +30,12 @@ export default function AiPanel({ onGenerate, onUpload }: Props) {
   const [tplId, setTplId] = useState('')
 
   useEffect(() => { api.listModels().then((ms) => setModels(ms.filter((m: any) => m.modality === 'image' && m.enabled === 1))) }, [])
+  // 张数上限取所选模型的能力声明（max_count），避免提交后端不接受的张数
+  const effectiveModel = models.find((m) => m.model_id === modelId) || models[0]
+  const maxCount = (() => {
+    try { return Number(JSON.parse(effectiveModel?.capabilities_json || '{}').max_count || 0) || 20 } catch { return 20 }
+  })()
+  useEffect(() => { if (maxCount > 0 && count > maxCount) setCount(maxCount) }, [maxCount, count])
   useEffect(() => { api.listPromptTemplatesPublic().then(setTpls).catch(() => setTpls([])) }, [])
 
   const cycle = () => {
@@ -54,7 +62,7 @@ export default function AiPanel({ onGenerate, onUpload }: Props) {
         <div className="ai-slots">
           <button className="slot" onClick={() => document.getElementById('ai-file')?.click()}>上传产品图</button>
           <span className="ai-text">生成</span>
-          <input className="ai-num" type="number" min={1} max={20} value={count} onChange={(e) => setCount(Number(e.target.value))} />
+          <input className="ai-num" type="number" min={1} max={maxCount} value={count} onChange={(e) => setCount(Number(e.target.value))} />
           <span className="ai-text">张</span>
           <select className="ai-sel" value={platform} onChange={(e) => setPlatform(e.target.value)}>{PLATFORMS.map((p) => <option key={p}>{p}</option>)}</select>
           <span className="ai-text">· 比例</span>
@@ -78,7 +86,7 @@ export default function AiPanel({ onGenerate, onUpload }: Props) {
         <button className="btn">Agent</button>
         <button className="btn primary" onClick={() => onGenerate({ count, platform, ratio, prompt, model_id: modelId || undefined, template_id: tplId || undefined })}>生成</button>
       </div>
-      <div className="ai-disclaimer">内容由 AI 生成</div>
+      <div className="ai-disclaimer">画幅按后端本地合成模型能力：1:1 / 3:4 / 4:3 / 16:9；内容由 AI 生成</div>
     </aside>
   )
 }

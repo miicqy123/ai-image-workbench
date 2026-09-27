@@ -4,15 +4,25 @@ import { api } from './api'
 /**
  * 登录页：身份由服务端会话决定。
  * 页面不再让用户"选择一个角色进入"——角色来自服务端 /api/auth/me。
+ *
+ * 本地开发便利：默认账号/密码可由本机 .env.local 在构建时注入（VITE_LOGIN_DEFAULT_*），
+ * 打开页面即已填好，直接点「登录」即可。该文件已被 gitignore，仓库内不保存任何口令。
  */
+const DEFAULT_USER = import.meta.env.VITE_LOGIN_DEFAULT_USER || 'usr_default'
+const DEFAULT_PASSWORD = import.meta.env.VITE_LOGIN_DEFAULT_PASSWORD || ''
 export default function LoginPage({ onLogin }: { onLogin: () => void }) {
-  const [userId, setUserId] = useState('usr_default')
+  const [userId, setUserId] = useState(DEFAULT_USER)
   const [password, setPassword] = useState('')
   const [needsBootstrap, setNeedsBootstrap] = useState<boolean | null>(null)
   const [name, setName] = useState('')
   const [confirm, setConfirm] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+
+  useEffect(() => {
+    // 仅在「需要登录」而非首次初始化时预填默认密码，避免影响 bootstrap 设置新密码
+    if (needsBootstrap === false && DEFAULT_PASSWORD) setPassword((cur) => cur || DEFAULT_PASSWORD)
+  }, [needsBootstrap])
 
   useEffect(() => {
     api.authBootstrapState().then((s) => {
@@ -72,6 +82,7 @@ export default function LoginPage({ onLogin }: { onLogin: () => void }) {
             <div className="field"><label>密码</label>
               <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
                 autoComplete="current-password" onKeyDown={(e) => { if (e.key === 'Enter') doLogin() }} /></div>
+            {DEFAULT_PASSWORD ? <div className="hint">已按本机 .env.local 预填默认账号，可直接点「登录」。</div> : null}
             <button className="btn primary" style={{ width: '100%' }} disabled={busy} onClick={doLogin}>
               {busy ? '登录中…' : '登录'}
             </button>

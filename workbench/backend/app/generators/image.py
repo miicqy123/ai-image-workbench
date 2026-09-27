@@ -156,7 +156,7 @@ def _shadow(im: Image.Image):
 
 
 def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int, h: int,
-                roles: list | None = None) -> Image.Image:
+                roles: list | None = None, draw_final_copy: bool = True) -> Image.Image:
     rnd = random.Random(seed)
     top, bottom = _scene_colors(prompt)
     canvas = _gradient(w, h, top, bottom)
@@ -169,6 +169,10 @@ def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int
     gd.ellipse([cx - w * 0.42, cy - h * 0.42, cx + w * 0.42, cy + h * 0.42], fill=(255, 255, 255, 40))
     canvas = Image.alpha_composite(canvas, glow.filter(ImageFilter.GaussianBlur(60)))
 
+    if not draw_final_copy:
+        params = dict(params or {})
+        params["title"] = ""
+        params["subtitle"] = ""
     # 按 role 选择主产品 / 辅图 / Logo（roles 缺失时第一张即主产品图，保持旧行为）
     primary, aux, logo = _pick_by_role(product_imgs, roles)
 
@@ -187,7 +191,8 @@ def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int
         bx, by, bw, bh = int(w * 0.22), int(h * 0.2), int(w * 0.56), int(h * 0.5)
         dr.rounded_rectangle([bx, by, bx + bw, by + bh], radius=24, fill=(255, 255, 255, 200), outline=(120, 120, 120, 255), width=3)
         f = _font(int(h * 0.04))
-        dr.text((w // 2, int(h * 0.45)), "未提供产品图", font=f, fill=(90, 90, 90, 255), anchor="mm")
+        if draw_final_copy:
+            dr.text((w // 2, int(h * 0.45)), "未提供产品图", font=f, fill=(90, 90, 90, 255), anchor="mm")
 
     # 右下辅图（role=product 第二张）：≤22%×22%，等比、不放大；底边止于 0.72h，避开标题/副标题区
     if aux is not None:
@@ -202,20 +207,22 @@ def compose_one(product_imgs: list, prompt: str, params: dict, seed: int, w: int
         canvas.alpha_composite(g, (int(w * LOCAL_LOGO_X), int(h * LOCAL_LOGO_Y)))
 
     # 文字层（可编辑，导出时叠加）：在最终画布上创建绘制对象，确保标题线/标题/副标题进入返回图像
-    dr = ImageDraw.Draw(canvas)
-    title = (params.get("title") or "产品主图").strip()
-    subtitle = (params.get("subtitle") or "").strip()
-    bar_y = int(h * 0.82)
-    dr.line([int(w * 0.12), bar_y, int(w * 0.88), bar_y], fill=(255, 255, 255, 160), width=3)
-    tf = _font(int(h * 0.07))
-    dr.text((w // 2, int(h * 0.78)), title, font=tf, fill=(40, 40, 40, 255), anchor="mm")
-    if subtitle:
-        sf = _font(int(h * 0.038))
-        dr.text((w // 2, int(h * 0.90)), subtitle, font=sf, fill=(70, 70, 70, 255), anchor="mm")
+    # 仅在 draw_final_copy=True 时绘制最终文案层；无字路径（m2 本地拼接器）不得落任何标题/副标题/配套分隔线
+    if draw_final_copy:
+        dr = ImageDraw.Draw(canvas)
+        title = (params.get("title") or "产品主图").strip()
+        subtitle = (params.get("subtitle") or "").strip()
+        bar_y = int(h * 0.82)
+        dr.line([int(w * 0.12), bar_y, int(w * 0.88), bar_y], fill=(255, 255, 255, 160), width=3)
+        tf = _font(int(h * 0.07))
+        dr.text((w // 2, int(h * 0.78)), title, font=tf, fill=(40, 40, 40, 255), anchor="mm")
+        if subtitle:
+            sf = _font(int(h * 0.038))
+            dr.text((w // 2, int(h * 0.90)), subtitle, font=sf, fill=(70, 70, 70, 255), anchor="mm")
     return canvas.convert("RGB")
 
 
-def generate(req: dict, reference_images: list, roles: list | None = None) -> dict:
+def generate(req: dict, reference_images: list, roles: list | None = None, draw_final_copy: bool = True) -> dict:
     """req: {model_id, prompt, negative_prompt, reference_asset_ids, aspect_ratio,
              resolution_tier, count, seed, params}。返回 GenerationResult。"""
     aspect = req.get("aspect_ratio", "1:1")
@@ -227,7 +234,7 @@ def generate(req: dict, reference_images: list, roles: list | None = None) -> di
 
     outputs = []
     for i in range(count):
-        im = compose_one(reference_images, req.get("prompt", ""), params, seed + i, w, h, roles=roles)
+        im = compose_one(reference_images, req.get("prompt", ""), params, seed + i, w, h, roles=roles, draw_final_copy=draw_final_copy)
         buf = io.BytesIO()
         im.save(buf, format="PNG")
         outputs.append({"bytes": buf.getvalue(), "width": w, "height": h})
@@ -285,12 +292,12 @@ def supports_task(adapter: str | None, task_type: str) -> bool:
 
 
 def dispatch(model_id: str, req: dict, reference_images: list, provider_cfg: dict | None = None,
-             adapter: str | None = None, roles: list | None = None) -> dict:
+             adapter: str | None = None, roles: list | None = None, draw_final_copy: bool = True) -> dict:
     task_type = req.get("task_type", "text_to_image")
     if model_id in ("local-poster-compositor", "demo-poster-compositor"):
         if task_type not in ("text_to_image", "image_to_image", "product_composition"):
             raise ValueError(f"演示拼接器不支持任务类型 {task_type}")
-        return generate(req, reference_images, roles=roles)
+        return generate(req, reference_images, roles=roles, draw_final_copy=draw_final_copy)
     if adapter and not supports_task(adapter, task_type):
         raise ValueError(f"模型 {model_id} 不支持任务类型 {task_type}；该适配器当前支持：{ADAPTER_TASKS.get(adapter, [])}")
     if adapter == "image_openai" and provider_cfg:

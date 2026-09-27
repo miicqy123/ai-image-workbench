@@ -1375,6 +1375,144 @@ def main() -> int:
     print(f"[G] SHA-256：T1={g_shas['T1'][:16]} T2={g_shas['T2'][:16]} T3={g_shas['T3'][:16]} T1b={g_shas['T1b'][:16]}")
     print(f"[G] 像素差异：T2-T1={g_d21}；T3-T1={g_d31}")
 
+    # ===== H. m2 产品合成闭环（切片1/2A/2B/3A 契约）=====
+    print("\n=== H. m2 产品合成闭环：缺图拒绝 → 无字候选 → 服务端标记 → 保存底图 → 导出 ===")
+    H_TITLE, H_SUB = "年终大促 全场五折", "限时三天 立即抢购"
+    H_PARAMS = {"count": 1, "aspect_ratio": "1:1", "resolution_tier": "standard",
+                "title": H_TITLE, "subtitle": H_SUB}
+    st_h, txt_h = req("POST", "/api/projects", {"name": "E2E测试·m2产品卖点海报", "template_id": "m2"})
+    pid_h = (jbody(txt_h) or {}).get("id")
+    check("H1 创建 m2 项目", bool(pid_h), f"HTTP {st_h} {txt_h[:160]}")
+    st_h, txt_h = req("POST", f"/api/projects/{pid_h}/graph/init-template", {"skeleton": "poster"})
+    check("H2 初始化 poster 骨架", st_h == 200, f"HTTP {st_h}")
+    g_h = graph_of(pid_h)
+    h_img, h_gen, h_lay = (nodes_by_type(g_h, "product_image"), nodes_by_type(g_h, "image_generation"),
+                           nodes_by_type(g_h, "layout_export"))
+    check("H3 骨架含 product_image / image_generation / layout_export",
+          bool(h_img and h_gen and h_lay), str([n["type"] for n in (g_h.get("nodes") or [])]))
+
+    h_nobind = run_node(h_gen["id"], {"model_id": MODEL_ID, "params": dict(H_PARAMS),
+                                      "idempotency_key": f"idem_H_nobind_{time.time()}"})
+    check("H4 未绑定产品图时 m2 生图被拒（保留缺图拒绝语义）",
+          h_nobind.get("status") == "failed" and "product_image_required" in str(h_nobind.get("error_code") or ""),
+          f"status={h_nobind.get('status')} err={str(h_nobind.get('error_code'))[:160]}")
+    check("H5 缺图拒绝未产出候选", not (h_nobind.get("outputs") or []), str(h_nobind.get("outputs"))[:120])
+
+    h_png = make_png(400, 400, (220, 40, 40, 255), "round")
+    st_h, h_asset = upload_asset(pid_h, "product_m2.png", h_png, "product")
+    check("H6 真实上传产品图", bool((h_asset or {}).get("id")), f"HTTP {st_h} {str(h_asset)[:160]}")
+    st_h, txt_h = req("PATCH", f"/api/nodes/{h_img['id']}",
+                      {"content": {"asset_id": h_asset.get("id"), "asset_role": "product",
+                                   "reference_asset_ids": [h_asset.get("id")]}})
+    check("H7 绑定产品图到上游 product_image 节点", st_h == 200, f"HTTP {st_h} {txt_h[:160]}")
+    h_run = run_node(h_gen["id"], {"model_id": MODEL_ID, "params": dict(H_PARAMS),
+                                   "idempotency_key": f"idem_H_{time.time()}"})
+    check("H8 绑定后 m2 生图成功", h_run.get("status") == "succeeded",
+          f"status={h_run.get('status')} err={str(h_run.get('error_code'))[:160]}")
+    h_outs = h_run.get("outputs") or []
+    check("H9 产出候选图", len(h_outs) >= 1, f"outputs={len(h_outs)}")
+    h_raw = (h_outs[0].get("output_json") if h_outs else "") or ""
+    h_meta = jbody(h_raw) or {}
+    check("H10 候选 no_final_copy 是 JSON 布尔 true（非字符串/数字）",
+          h_meta.get("no_final_copy") is True and '"no_final_copy": true' in h_raw, h_raw[:200])
+    check("H11 候选 copy_layer == none-v2", h_meta.get("copy_layer") == "none-v2", h_raw[:200])
+    h_aid = h_outs[0].get("asset_id") if h_outs else None
+    st_h, h_cand_raw = fetch_raw(f"/files/{h_aid}")
+    try:
+        h_cand = Image.open(io.BytesIO(h_cand_raw)).convert("RGB") if st_h == 200 and h_cand_raw else None
+    except Exception as h_err:
+        h_cand = None
+        print("    H 候选解码异常:", h_err)
+    check("H12 候选可解码", h_cand is not None, f"HTTP {st_h} bytes={len(h_cand_raw or b'')}")
+    h_w, h_h = h_cand.size
+    h_band_top, h_band_bot = int(h_h * 0.70), int(h_h * 0.96)
+    h_px = h_cand.load()
+    h_dark_band = sum(1 for y in range(h_band_top, h_band_bot) for x in range(h_w)
+                      if sum(h_px[x, y]) / 3 < 120)
+    check("H13 新候选在文案带内无预绘文字（无字底图）", h_dark_band == 0, f"band_dark={h_dark_band}")
+
+    st_h, txt_h = req("POST", f"/api/projects/{pid_h}/layout/export",
+                      {"base_asset_id": h_aid, "title": H_TITLE, "subtitle": H_SUB})
+    check("H14 未保存底图时导出被拒（base_not_saved）", st_h == 409 and "base_not_saved" in txt_h,
+          f"HTTP {st_h} {txt_h[:200]}")
+    st_h, txt_h = req("PATCH", f"/api/nodes/{h_lay['id']}",
+                      {"content": {"base_asset_id": h_aid, "title": H_TITLE, "subtitle": H_SUB}})
+    h_lay2 = nodes_by_type(graph_of(pid_h), "layout_export")
+    check("H15 底图选择已保存并回读一致",
+          (h_lay2.get("content") or {}).get("base_asset_id") == h_aid,
+          str((h_lay2.get("content") or {}).get("base_asset_id")))
+    st_h, txt_h = req("POST", f"/api/projects/{pid_h}/layout/export",
+                      {"base_asset_id": h_aid, "title": H_TITLE, "subtitle": H_SUB})
+    h_exp = jbody(txt_h) or {}
+    check("H16 保存后的合法底图导出成功", st_h == 200 and bool(h_exp.get("asset_id")), f"HTTP {st_h} {txt_h[:200]}")
+    st_h, h_exp_raw = fetch_raw(f"/files/{h_exp.get('asset_id')}")
+    try:
+        h_out = Image.open(io.BytesIO(h_exp_raw)).convert("RGB") if st_h == 200 and h_exp_raw else None
+    except Exception as h_err2:
+        h_out = None
+        print("    H 导出解码异常:", h_err2)
+    check("H17 导出图可解码且尺寸与底图一致", h_out is not None and h_cand is not None and h_out.size == h_cand.size,
+          f"HTTP {st_h} size={h_out.size if h_out else None} base={h_cand.size if h_cand else None}")
+    h_d = px_diff(h_cand, h_out) or {}
+    h_bb = h_d.get("bbox")
+    check("H18 导出确实新增了最终文案", (h_d.get("diff_pixels") or 0) > 0, str(h_d))
+    check("H19 新增文案全部落在 0.70h-0.96h 安全带内（不进入产品区/不越界）",
+          bool(h_bb) and h_bb[1] >= h_band_top and h_bb[3] <= h_band_bot, f"bbox={h_bb} band=({h_band_top},{h_band_bot})")
+
+    # H-e 逐字核对：把同一文案交给非 m2（旧路径）项目导出，作为“同字号同字形”参照
+    _ref_buf = io.BytesIO()
+    Image.new("RGB", (1024, 1024), (236, 226, 213)).save(_ref_buf, "PNG")
+    st_h, _ref_asset = upload_asset(pid, "ref_canvas.png", _ref_buf.getvalue(), "reference")
+    g_ref_base = (_ref_asset or {}).get("id")
+    check("H20a 参照用干净底图已上传（无预绘文字，避免与旧标题叠墨）", bool(g_ref_base), str(_ref_asset)[:140])
+    st_h, txt_h = req("POST", f"/api/projects/{pid}/layout/export",
+                      {"base_asset_id": g_ref_base, "title": H_TITLE, "subtitle": ""})
+    ref_t = jbody(txt_h) or {}
+    st_h2, ref_t_raw = fetch_raw(f"/files/{ref_t.get('asset_id')}")
+    st_h3, ref_base_raw = fetch_raw(f"/files/{g_ref_base}")
+    st_h4, txt_h4 = req("POST", f"/api/projects/{pid}/layout/export",
+                        {"base_asset_id": g_ref_base, "title": "", "subtitle": H_SUB})
+    ref_s = jbody(txt_h4) or {}
+    st_h5, ref_s_raw = fetch_raw(f"/files/{ref_s.get('asset_id')}")
+    ref_im_t = Image.open(io.BytesIO(ref_t_raw)).convert("RGB") if ref_t_raw else None
+    ref_im_s = Image.open(io.BytesIO(ref_s_raw)).convert("RGB") if ref_s_raw else None
+    ref_base = Image.open(io.BytesIO(ref_base_raw)).convert("RGB") if ref_base_raw else None
+    check("H20 参照导出（非 m2 旧路径）可用", ref_im_t is not None and ref_im_s is not None and ref_base is not None,
+          f"t={st_h2} s={st_h5} base={st_h3}")
+    if ref_im_t is not None and h_out is not None and ref_base is not None and ref_im_t.size == h_out.size:
+        h_tb = (0, int(h_h * 0.72), h_w, int(h_h * 0.86))
+        h_sb = (0, int(h_h * 0.87), h_w, int(h_h * 0.96))
+        h_t_ink = px_diff(h_cand.crop(h_tb), h_out.crop(h_tb)) or {}
+        h_s_ink = px_diff(h_cand.crop(h_sb), h_out.crop(h_sb)) or {}
+        r_t_ink = px_diff(ref_base.crop(h_tb), ref_im_t.crop(h_tb)) or {}
+        r_s_ink = px_diff(ref_base.crop(h_sb), ref_im_s.crop(h_sb)) or {}
+        rt_n, ht_n = (r_t_ink.get("diff_pixels") or 0), (h_t_ink.get("diff_pixels") or 0)
+        rs_n, hs_n = (r_s_ink.get("diff_pixels") or 0), (h_s_ink.get("diff_pixels") or 0)
+        check("H21 标题逐字相同（含空格）：墨迹像素数与同字号参照一致（无丢字/重复字）",
+              rt_n > 0 and abs(ht_n - rt_n) <= max(3, int(rt_n * 0.03)), f"m2={ht_n} ref={rt_n}")
+        check("H22 副标题逐字相同（含空格）：墨迹像素数与同字号参照一致",
+              rs_n > 0 and abs(hs_n - rs_n) <= max(3, int(rs_n * 0.03)), f"m2={hs_n} ref={rs_n}")
+        rt_bb, ht_bb = (r_t_ink.get("bbox") or (0, 0, 0, 0)), (h_t_ink.get("bbox") or (0, 0, 0, 0))
+        check("H23 标题文字宽度与参照一致（空格/字符未被吞掉）",
+              abs((ht_bb[2] - ht_bb[0]) - (rt_bb[2] - rt_bb[0])) <= 3,
+              f"m2宽={ht_bb[2] - ht_bb[0]} 参照宽={rt_bb[2] - rt_bb[0]}")
+        _t_y0, _t_y1 = ht_bb[1] + h_tb[1], ht_bb[3] + h_tb[1]
+        _s_bb = (h_s_ink.get("bbox") or (0, 0, 0, 0))
+        _s_y0, _s_y1 = _s_bb[1] + h_sb[1], _s_bb[3] + h_sb[1]
+        check("H24 标题与副标题墨迹互不重叠且各自在安全带内（绝对坐标）",
+              _t_y1 < _s_y0 and _t_y0 >= int(h_h * 0.72) and _t_y1 <= int(h_h * 0.86)
+              and _s_y0 >= int(h_h * 0.87) and _s_y1 <= int(h_h * 0.96),
+              f"标题y={_t_y0}..{_t_y1} 副标题y={_s_y0}..{_s_y1}")
+    else:
+        check("H21-H24 逐字核对前置（参照图与导出一致尺寸）", False, "参照或导出缺失/尺寸不一致")
+
+    st_h, txt_h = req("PATCH", f"/api/nodes/{h_lay['id']}",
+                      {"content": {"base_asset_id": h_asset.get("id"), "title": H_TITLE}})
+    st_h, txt_h = req("POST", f"/api/projects/{pid_h}/layout/export",
+                      {"base_asset_id": h_asset.get("id"), "title": H_TITLE, "subtitle": H_SUB})
+    check("H25 非 none-v2 来源的底图（普通上传图）被拒且提示重新生成",
+          st_h == 409 and "重新生成" in txt_h, f"HTTP {st_h} {txt_h[:200]}")
+
     print("\n【未覆盖项】")
     if NOT_COVERED:
         for item in NOT_COVERED:

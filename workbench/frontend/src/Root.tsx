@@ -59,7 +59,7 @@ export default function Root() {
         {screen === 'home' ? <HomePage onQuickCreate={() => setScreen('gallery')} onProjects={() => setScreen('projects')} />
           : screen === 'projects' ? <ProjectsPage onOpen={() => setScreen('workflow')} />
           : screen === 'design' && template ? <DesignCanvas template={template} onBack={() => setScreen('gallery')} />
-          : screen === 'workflow' ? <div style={{ position: 'relative', height: '100%' }}><App templateName={template?.name} skeleton={template?.skeleton} onBack={() => { setTemplate(null); setScreen('gallery') }} /></div>
+          : screen === 'workflow' ? <div style={{ position: 'relative', height: '100%' }}><App templateId={template?.id} templateName={template?.name} skeleton={template?.skeleton} onBack={() => { setTemplate(null); setScreen('gallery') }} /></div>
           : <Gallery onUse={(t) => { setTemplate(t); setScreen('workflow') }} onWorkflow={() => { setTemplate(null); setScreen('workflow') }} onDesign={() => { setTemplate(DEFAULT_TEMPLATE); setScreen('design') }} onAdmin={canAdmin ? () => setArea('admin') : undefined} />}
       </div>
     </div>

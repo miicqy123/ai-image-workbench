@@ -2,10 +2,25 @@ import { Asset, GraphData, ModelInfo, Provider, WBNode } from './types'
 
 const BASE = ''
 
+/** 服务端明确拒绝（非 2xx）：保留 message 既有格式，同时带上 status 与解析后的 detail 供页面区分处理 */
+export class ApiError extends Error {
+  status: number
+  detail: any
+  constructor(status: number, detail: any, text: string) {
+    super(`${status}: ${text}`)
+    this.name = 'ApiError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const t = await res.text()
-    throw new Error(`${res.status}: ${t}`)
+    let parsed: any = null
+    try { parsed = JSON.parse(t) } catch { parsed = null }
+    const detail = parsed && Object.prototype.hasOwnProperty.call(parsed, 'detail') ? parsed.detail : parsed
+    throw new ApiError(res.status, detail, t)
   }
   return res.json() as Promise<T>
 }

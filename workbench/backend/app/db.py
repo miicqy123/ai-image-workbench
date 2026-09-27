@@ -14,6 +14,11 @@ from contextlib import contextmanager
 DB_PATH = os.environ.get("WB_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "data", "db", "workbench.db"))
 _lock = threading.Lock()
 
+# 阶段C补修第二批：同一 node_id 最多一条 queued/running 的数据库级约束（部分唯一索引）
+INFLIGHT_UNIQUE_INDEX = "uq_node_runs_one_inflight"
+INFLIGHT_INDEX_OK = False
+INFLIGHT_INDEX_ERROR = ""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY, name TEXT
@@ -207,11 +212,17 @@ def _connect() -> sqlite3.Connection:
 
 
 @contextmanager
-def tx():
-    """单连接事务：在全局锁内复用同一连接，提交或回滚。"""
+def tx(immediate: bool = False):
+    """单连接事务：在全局锁内复用同一连接，提交或回滚。
+
+    immediate=True 时以 BEGIN IMMEDIATE 开始，写入意图在事务一开始就取得数据库的 RESERVED 锁，
+    与另一个进程的 BEGIN IMMEDIATE 事务互斥（跨进程），用于“检查在途 → 写入/删除”这类需要原子性的保护。
+    """
     with _lock:
         conn = _connect()
         try:
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
@@ -262,6 +273,17 @@ def init_db() -> None:
         if "require_review" not in tcols:
             conn.execute("ALTER TABLE templates ADD COLUMN require_review INTEGER NOT NULL DEFAULT 0")
         conn.commit()
+        # 阶段C补修第二批：同一节点最多一条在途运行（部分唯一索引，只约束 queued/running，不影响历史记录）
+        # 若既有库存在重复在途记录（历史脏数据），不删除/不改写任何记录，只记录状态并暴露到 /api/health
+        global INFLIGHT_INDEX_OK, INFLIGHT_INDEX_ERROR
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS %s ON node_runs(node_id) "
+                         "WHERE status IN ('queued','running')" % INFLIGHT_UNIQUE_INDEX)
+            conn.commit()
+            INFLIGHT_INDEX_OK, INFLIGHT_INDEX_ERROR = True, ""
+        except sqlite3.Error as e:
+            conn.rollback()
+            INFLIGHT_INDEX_OK, INFLIGHT_INDEX_ERROR = False, str(e)[:200]
         # 默认组织与初始额度（单机演示；生产应做真实计费与隔离）
         conn.execute("INSERT OR IGNORE INTO organizations(id,name,plan,credit_balance,quota_total,daily_limit,period_start,created_at) "
                      "VALUES(?,?,?,?,?,?,?,?)",
@@ -322,6 +344,12 @@ def query_one(sql: str, params=()) -> dict | None:
 
 def now() -> float:
     return time.time()
+
+
+def inflight_conflicts() -> list:
+    """只读列出“同一节点存在多条 queued/running”的冲突清单（用于人工排查，不做任何清理）。"""
+    return query("SELECT node_id, count(*) AS inflight, group_concat(id) AS run_ids "
+                 "FROM node_runs WHERE status IN ('queued','running') GROUP BY node_id HAVING count(*) > 1")
 
 
 def audit(project_id, actor_id, action, entity_id, before_version=None, after_version=None):
